@@ -1,0 +1,30 @@
+# asrlib / thesis experiments: Python >= 3.11
+# Lower bounds only, so Colab's preinstalled torch/numpy satisfy them and don't get reinstalled.
+#
+# Laptop / Quest (CPU):  python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+# Colab (GPU):           pip install -r requirements.txt, but first change "carfac[jax] @" to "carfac @"
+#                        below, so Colab's GPU build of JAX is kept (see carfac_setup_notes.md)
+
+# PYTHON VERIONS: python=3.12.15
+
+# --- deep learning core ---
+torch>=2.4
+torchaudio>=2.4
+
+# --- audio + data ---
+numpy>=1.26
+scipy>=1.11
+soundfile>=0.12
+datasets>=3.0          # LibriSpeech parquet shards from Hugging Face
+pandas>=2.1            # per-utterance results, benchmark tables
+
+# --- CARFAC (JAX port), pinned to the commit verified in M4 ---
+carfac[jax] @ git+https://github.com/google/carfac.git@77d8a91f24d2f5873783dc0ce767d32778b938bc#subdirectory=python
+
+# --- utilities ---
+tqdm>=4.66
+matplotlib>=3.8
+
+# --- dev / notebooks (laptop only; harmless elsewhere) ---
+pytest>=8.0
+ipykernel>=6.29

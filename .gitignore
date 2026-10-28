@@ -1,0 +1,18 @@
+# Workspace folders (data, never code)
+datasets/
+features/
+noise/
+models/
+results/
+
+# Python
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/settings.json
+
+# MacOS
+.DS_Store

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asrlib"
+version = "0.1.0"
+description = "ASR experiments comparing CARFAC with mel/MFCC front ends in adverse conditions"
+license = "Apache-2.0"
+authors = [{ name = "Eric Oliveira" }]
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "torch>=2.4", "torchaudio>=2.4", "numpy>=1.26", "scipy>=1.11",
+    "soundfile>=0.12", "datasets>=3.0", "pandas>=2.1", "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+carfac = ["carfac[jax] @ git+https://github.com/google/carfac.git@77d8a91f24d2f5873783dc0ce767d32778b938bc#subdirectory=python"]
+dev = ["pytest>=8.0", "matplotlib>=3.8", "ipykernel>=6.29"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
