@@ -36,7 +36,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Subset
 
 from .cache import CachedFeatures, FeatureStore
-from .conditions import CLEAN, Condition, NoiseBank
+from .conditions import Condition, NoiseBank
 from .config import ASRConfig
 from .constants import CARFAC_COMMIT, AudioLike
 from .data import FeatureDataset, LengthBucketSampler, SpeechCorpus, _to_mono_16k, collate

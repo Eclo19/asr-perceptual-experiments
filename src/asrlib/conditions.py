@@ -10,12 +10,13 @@ Date: 10/27/2026
 
 """
 
+from __future__ import annotations
+
 import json
 import os
 import tempfile
 from math import gcd
 import hashlib
-from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Sequence
 from pathlib import Path
