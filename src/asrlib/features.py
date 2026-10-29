@@ -69,9 +69,8 @@ class Featurizer:
         # The speech level (dB SPL) every training utterance was scaled to; transcribe() matches it
         self.train_level_db_spl = train_level_db_spl
 
-    def __call__(self, wave: torch.Tensor, *, condition: Condition | None = None,
-                 utt_id: str = "adhoc", bank: NoiseBank | None = None,
-                 train: bool = False, calibrate_level: bool = True) -> torch.Tensor:
+    def __call__(self, wave, *, condition=None, utt_id="adhoc", bank=None, variant: int = 0,
+                 train=False, calibrate_level=True):
         """Waveform f32[N] at 16 kHz → model-ready f32[T, F].
 
         condition given:  condition.apply(...) sets the level and adds noise.
@@ -81,7 +80,7 @@ class Featurizer:
         """
         # 1. Level and noise: a Condition does both; otherwise just match the training level
         if condition is not None:
-            wave = condition.apply(wave, utt_id, bank=bank)
+            wave = condition.apply(wave, utt_id, bank=bank, variant=variant)
         elif calibrate_level:
             wave = set_level(wave, self.train_level_db_spl)
 
