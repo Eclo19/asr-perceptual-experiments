@@ -115,7 +115,7 @@ class FeatureStore:
         meta = {
             "frontend": frontend.cfg.to_dict(), "cache_key": frontend.cfg.cache_key(),
             "n_feats": frontend.n_feats,
-            "cf_hz": [float(f) for f in getattr(frontend, "cf_hz", None) or []],
+            "cf_hz": [] if getattr(frontend, "cf_hz", None) is None else [float(f) for f in frontend.cf_hz],
             "corpus": corpus.name, "split": corpus.split, "n_utts": len(corpus),
             "condition": condition.name, "variant": variant,
             "hours": float(n_samples.sum() / SAMPLE_RATE / 3600),

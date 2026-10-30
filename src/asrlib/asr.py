@@ -253,7 +253,7 @@ class ASR:
         log_probs, out_lens = probe(feats, feat_lens)
         assert log_probs.shape == (feats.size(0), int(out_lens.max()), self.tokenizer.vocab_size)
         min_ratio = float((out_lens.float() / tok_lens.float()).min())
-        initial = float(probe.loss(feats, feat_lens, tokens, tok_lens))
+        initial = probe.loss(feats, feat_lens, tokens, tok_lens).item()
         print(f"log_probs {tuple(log_probs.shape)} | min frames per token {min_ratio:.2f} (must be > 1) | "
               f"initial loss {initial:.2f}")
 
