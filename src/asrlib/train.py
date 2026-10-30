@@ -159,8 +159,8 @@ class Trainer:
         """Train from self.epoch (0, or wherever a resumed run left off) to tcfg.epochs.
 
         After every epoch: record it in History, call on_epoch_end(trainer, record, is_best)
-        (ASR.fit saves checkpoints there), and stop early if val WER hasn't improved for
-        early_stop_patience epochs.
+        (ASR.fit saves checkpoints there), and stop early if the best model hasn't improved for
+        early_stop_patience epochs. "Best" = lowest val WER; on a tie, lowest val loss.
         """
         patience = self.tcfg.early_stop_patience
 
@@ -172,15 +172,18 @@ class Trainer:
             val = self.validate()
             self.epoch += 1
 
-            # Record the epoch, and whether it's the best so far
+            # Record the epoch
             record = {"epoch": self.epoch, "train_loss": train_loss, "val_loss": val["val_loss"],
                       "val_wer": val["val_wer"], "val_cer": val["val_cer"], "lr": lr,
                       "seconds": time.perf_counter() - t0}
             self.history.epochs.append(record)
-            is_best = val["val_wer"] < self.history.best_val_wer
+
+            # Best = lowest val WER; on a tie, lower val loss (a better-converged model)
+            h = self.history
+            is_best = (val["val_wer"] < h.best_val_wer
+                       or (val["val_wer"] == h.best_val_wer and val["val_loss"] < h.best_val_loss))
             if is_best:
-                self.history.best_val_wer = val["val_wer"]
-                self.history.best_epoch = self.epoch
+                h.best_val_wer, h.best_val_loss, h.best_epoch = val["val_wer"], val["val_loss"], self.epoch
 
             hyp, ref = val["example"]
             print(f"epoch {self.epoch:3d}/{self.tcfg.epochs} | lr {lr:.1e} | train {train_loss:.3f} | "
@@ -190,9 +193,9 @@ class Trainer:
             if on_epoch_end is not None:
                 on_epoch_end(self, record, is_best)
 
-            # Early stopping: no improvement for `patience` epochs
-            if patience is not None and self.epoch - self.history.best_epoch >= patience:
-                print(f"No val WER improvement for {patience} epochs; stopping.")
+            # Early stopping: the best model hasn't changed for `patience` epochs
+            if patience is not None and self.epoch - h.best_epoch >= patience:
+                print(f"No improvement in val WER (or val loss at equal WER) for {patience} epochs; stopping.")
                 break
 
         return self.history

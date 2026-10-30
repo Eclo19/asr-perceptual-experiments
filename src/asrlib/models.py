@@ -180,6 +180,13 @@ class TransformerCTC(AcousticModel):
 
     def loss(self, feats, feat_lens, tokens, tok_lens) -> torch.Tensor:
         """Mean CTC loss over the batch. Padding frames and padding tokens are excluded by the lengths."""
+        # PyTorch has no CTC loss for Apple's MPS (pytorch issue 141287): fail clearly, before any work
+        if feats.device.type == "mps":
+            raise RuntimeError(
+                "CTC loss isn't implemented on Apple MPS, so training and evaluation can't run there. "
+                "Use device='cpu' on the Mac (e.g. run_e2e.py --device cpu) and CUDA on Quest. "
+                "transcribe() works on MPS: it only decodes.")
+
         log_probs, out_lens = self(feats, feat_lens)
 
         # CTCLoss wants (T', B, V), and fp32: it sums many tiny probabilities, which bf16 can't hold

@@ -181,3 +181,4 @@ class History:
     epochs: list[dict] = field(default_factory=list)
     best_epoch: int | None = None
     best_val_wer: float = float("inf")
+    best_val_loss: float = float("inf")           # tie-breaker when two epochs have the same WER
