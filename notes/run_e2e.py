@@ -14,7 +14,7 @@ Run from anywhere (laptop, Quest login or compute node, Colab):
 Exit code 0 = every stage passed or was skipped; 1 = at least one stage failed.
 
 Author: Eric Oliveira
-Date: 10/30/2026
+Date: 10/30/2026 
 
 * Written with the help of Claude *
 
@@ -135,8 +135,7 @@ state: dict = {}
 def stage_environment():
     """Where we are running, with what. Nothing here can fail except a wrong Python version."""
     info = environment_info()
-    #device = pick_device(args.device)
-    device = pick_device("cpu")
+    device = pick_device(args.device)
     state["device"] = device
 
     print(f"  asrlib      {Path(asrlib.__file__).parent}  (commit {info.get('asrlib_commit')})")
