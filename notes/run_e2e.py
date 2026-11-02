@@ -135,7 +135,8 @@ state: dict = {}
 def stage_environment():
     """Where we are running, with what. Nothing here can fail except a wrong Python version."""
     info = environment_info()
-    device = pick_device(args.device)
+    #device = pick_device(args.device)
+    device = pick_device("cpu")
     state["device"] = device
 
     print(f"  asrlib      {Path(asrlib.__file__).parent}  (commit {info.get('asrlib_commit')})")
