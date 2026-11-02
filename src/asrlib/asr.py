@@ -229,6 +229,7 @@ class ASR:
                   condition: Condition | None = None, utt_id: str = "adhoc") -> torch.Tensor:
         """Features f32[T, F] exactly as the model sees them at evaluation time (no SpecAugment).
         For plotting a mel spectrogram and a CARFAC NAP side by side."""
+        self._fit_normalizer()
         wave = self._load_audio(audio, sr)
         bank = self.noise_bank() if condition is not None and condition.noise else None
         return self.featurizer(wave, condition=condition, utt_id=utt_id, bank=bank, train=False)
@@ -308,8 +309,64 @@ class ASR:
                 caches.append(store.get(self.frontend, corpus, c, bank=bank, variant=variant))
         return caches
 
+    def _fit_normalizer(self, max_utts: int = 2000) -> None:
+        """Global normalization only: per-channel mean/std of post() features over the training data.
+
+        Measured on the TRAINING split under the training conditions (what the model learns from),
+        on a fixed random subset of utterances. The subset depends on nothing but the corpus, so
+        every front end and every seed is normalized from the same utterances. Runs once, in the
+        main process, before any DataLoader starts; save() stores the result and load() restores it.
+        """
+        if self.normalizer.is_fitted:
+            return
+
+        t = self.cfg.train
+        corpus = self.corpus(self.cfg.data.train_split)
+        conditions = list(t.train_conditions)
+
+        # Same utterances for every front end and seed: a fixed seed, not cfg.seed
+        rng = np.random.default_rng(0)
+        n = min(len(corpus), max(1, max_utts // len(conditions)))
+        utts = np.sort(rng.choice(len(corpus), size=n, replace=False))
+        print(f"Global normalization: statistics from {n} utterances x {len(conditions)} condition(s)...")
+
+        bank = self.noise_bank()
+        bank.preload(sorted({c.noise for c in conditions if c.noise}))
+
+        # CARFAC: read the training caches (fit() needs them anyway); mel/MFCC: compute live
+        caches = self._caches(corpus, conditions, bank, t.n_noisy_variants) if self.frontend.expensive else None
+
+        total = total_sq = None
+        n_frames = 0
+        for k, cond in enumerate(conditions):
+            # _caches lists one cache per (condition, variant): the first variant of condition k
+            cache = None
+            if caches is not None:
+                cache = caches[sum(max(1, t.n_noisy_variants) if c.noise else 1 for c in conditions[:k])]
+
+            for i in utts:
+                if cache is not None:
+                    raw = cache[int(i)]
+                else:
+                    utt = corpus[int(i)]
+                    raw = self.frontend.extract(cond.apply(utt.wave, utt.utt_id, bank=bank))
+
+                # Accumulate in float64: millions of frames
+                feats = self.frontend.post(raw.float()).double()                    # (T, F)
+                s, sq = feats.sum(dim=0), feats.pow(2).sum(dim=0)
+                total = s if total is None else total + s
+                total_sq = sq if total_sq is None else total_sq + sq
+                n_frames += feats.shape[0]
+
+        mean = total / n_frames
+        std = (total_sq / n_frames - mean ** 2).clamp_min(0).sqrt()
+        self.normalizer.set_stats(mean, std)
+        print(f"  {n_frames:,} frames | mean {mean.mean():.3f} | std {std.mean():.3f} (averaged over channels)")
+
     def _make_dataset(self, split: str, conditions: Sequence[Condition], train: bool,
                       n_variants: int = 0) -> FeatureDataset:
+        # Global statistics must exist before the Featurizer is copied into DataLoader workers
+        self._fit_normalizer()
         corpus = self.corpus(split)
 
         # Load recorded noise in the main process, so splits.json is fixed before workers start
@@ -432,6 +489,7 @@ class ASR:
         """
         single = isinstance(audio, (str, Path, np.ndarray, torch.Tensor))
         items = [audio] if single else list(audio)
+        self._fit_normalizer()
 
         # 1–2. Load each input and compute its features exactly as at evaluation time
         feats = [self.featurizer(self._load_audio(a, sr), train=False, calibrate_level=calibrate_level)
@@ -556,6 +614,9 @@ class ASR:
     def _load_weights(self, pt_path: Path) -> dict:
         ckpt = torch.load(pt_path, map_location=self.device, weights_only=True)
         self.model.load_state_dict(ckpt["model_state"])                          # strict: shapes must match
+
+        # The normalizer travels with the weights: global statistics are part of the trained model
+        self.normalizer.load_state_dict(ckpt["normalizer"])
         return ckpt
 
     @classmethod

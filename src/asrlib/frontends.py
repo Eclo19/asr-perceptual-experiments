@@ -71,7 +71,7 @@ class FrontEnd(ABC):
 class LogMel(FrontEnd):
     """Log-mel filterbank (torchaudio), set entirely by LogMelConfig and the shared constants.
 
-    25 ms Hann window (n_fft = win_length = 400 at 16 kHz, as in the notebook), 10 ms hop,
+    25 ms Hann window (400 samples, zero-padded to n_fft = 512, the next power of 2), 10 ms hop,
     power spectrum → n_mels triangular filters. center=True pads the signal, so
     T = N // HOP_LENGTH + 1, the frame-count contract.
     """
@@ -83,7 +83,7 @@ class LogMel(FrontEnd):
         # Window length in samples: 25 ms at 16 kHz → 400
         win_length = int(round(cfg.win_ms / 1000 * SAMPLE_RATE))
 
-        # n_fft = win_length, as in the notebook, so the regression check compares like with like
+        # n_fft: the next power of 2 above the window (512), a deliberate change from the notebook's 400
         self.melspec = torchaudio.transforms.MelSpectrogram(
             sample_rate=SAMPLE_RATE,
             n_fft= 1 << (win_length - 1).bit_length(), # Next power of 2
@@ -127,7 +127,7 @@ class MFCC(FrontEnd):
 
 @register("frontend", "carfac")
 class CARFAC(FrontEnd):
-    """CARFAC v2 NAP (JAX port), mean-pooled to 100 frames/s.
+    """CARFAC v2 NAP (JAX port), pooled to 100 frames/s (25 ms Hann windows by default, like log-mel).
 
     Design happens once, in __init__, and every utterance starts from the same initial
     state. That's safe because JAX is functional: running an utterance returns a NEW
@@ -142,6 +142,10 @@ class CARFAC(FrontEnd):
     """
     expensive = True
     CHUNK = SAMPLE_RATE                     # 1 s of samples per lax.scan step
+
+    # hann25 pooling works on a 1 kHz copy of the NAP: means of 16-sample blocks
+    BLOCK = 16                              # samples per 1 ms block
+    HANN_BLOCKS = 25                        # 25 ms window = 25 blocks
 
     def __init__(self, cfg: CarfacConfig):
         self.cfg = cfg
@@ -170,7 +174,14 @@ class CARFAC(FrontEnd):
         self.cf_hz = np.asarray(self.hypers.ears[0].pole_freqs)[::-1].copy()             # low → high CF
         self.rest_output = float(np.ravel(self.weights.ears[0].ihc.rest_output)[0])      # ≈ 0.81, two_cap
 
-        # 4. Compile: vmap batches _one over utterances, jit compiles it (once per batch shape)
+        # 4. hann25 pooling weights: log-mel's 400-sample Hann window (periodic, as torchaudio's),
+        #    sampled at the centre of each 1 ms block, then scaled to sum to 1 (a weighted MEAN,
+        #    so both poolings give firing rates on the same scale)
+        centers = np.arange(self.HANN_BLOCKS) * self.BLOCK + self.BLOCK / 2                # 8, 24, ..., 392
+        hann = 0.5 - 0.5 * np.cos(2 * np.pi * centers / (self.HANN_BLOCKS * self.BLOCK))
+        self._hann = jnp.asarray(hann / hann.sum(), dtype=jnp.float32)                    # (25,)
+
+        # 5. Compile: vmap batches _one over utterances, jit compiles it (once per batch shape)
         self._batched = jax.jit(jax.vmap(self._one))
 
     def _design_params(self):
@@ -192,9 +203,16 @@ class CARFAC(FrontEnd):
         return params
 
     def _one(self, wave):
-        """One utterance, wave f32[L] with L a multiple of CHUNK → pooled NAP f32[L // 160, n_ch]."""
-        cj = self._cj
-        frames_per_chunk = self.CHUNK // HOP_LENGTH                                       # 100
+        """One utterance, wave f32[L] with L a multiple of CHUNK → pooled NAP f32[L // 160, n_ch].
+
+        hann25: frame t is centred on sample 160·t, like log-mel's frames (center=True).
+        box10 keeps the original definition: the mean of samples [160·t, 160·t + 160).
+        """
+        cj, jnp = self._cj, self._jnp
+        box10 = self.cfg.pooling == "box10"
+
+        # Samples averaged per output row of each chunk: 160 (box10: final frames) or 16 (1 kHz blocks)
+        group = HOP_LENGTH if box10 else self.BLOCK
 
         def step(state, chunk):
             # Run 1 s of audio, continuing from the previous chunk's state
@@ -202,12 +220,29 @@ class CARFAC(FrontEnd):
                                  open_loop=self.cfg.open_loop)
             nap = out.naps[:, :, 0]                                                       # (16000, n_ch)
 
-            # Mean over each 160-sample window: 100 frames per chunk
-            pooled = nap.reshape(frames_per_chunk, HOP_LENGTH, -1).mean(axis=1)           # (100, n_ch)
+            # Mean over each group of samples: 100 frames (box10) or 1000 blocks (hann25) per chunk
+            pooled = nap.reshape(self.CHUNK // group, group, -1).mean(axis=1)              # (100 or 1000, n_ch)
             return out.state, pooled
 
-        _, frames = self._jax.lax.scan(step, self.state0, wave.reshape(-1, self.CHUNK))  # (n_chunks, 100, n_ch)
-        return frames.reshape(-1, self.n_feats)                                          # (L // 160, n_ch)
+        _, rows = self._jax.lax.scan(step, self.state0, wave.reshape(-1, self.CHUNK))    # (n_chunks, rows, n_ch)
+        rows = rows.reshape(-1, self.n_feats)                                             # (L // group, n_ch)
+        if box10:
+            return rows                                                                   # (L // 160, n_ch)
+
+        # hann25: a 25 ms Hann window every 10 ms over the 1 kHz NAP. Frame t covers blocks 10t-12 .. 10t+12,
+        # i.e. samples 160t-192 .. 160t+208 (log-mel: 160t-200 .. 160t+200). Zero padding before the
+        # start = the NAP of silence (the resting rate is added later, in extract_batch)
+        step_blocks = HOP_LENGTH // self.BLOCK                                            # 10
+        n_frames = rows.shape[0] // step_blocks                                           # L // 160
+        half = self.HANN_BLOCKS // 2                                                      # 12
+        padded = jnp.pad(rows, ((half, half), (0, 0)))                                    # (L // 16 + 24, n_ch)
+
+        # Weighted sum, one window tap at a time: tap k reads every 10th block starting at block k.
+        # (25 strided slices instead of a (frames, 25, n_ch) gather: same result, 25x less memory)
+        frames = jnp.zeros((n_frames, self.n_feats), rows.dtype)
+        for k in range(self.HANN_BLOCKS):
+            frames = frames + self._hann[k] * padded[k: k + step_blocks * n_frames: step_blocks]
+        return frames                                                                     # (L // 160, n_ch)
 
     def extract_batch(self, waves: Sequence[torch.Tensor]) -> list[torch.Tensor]:
         """Several utterances at once -> list of firing RATE tensors f32[N_i // 160 + 1, n_feats]."""

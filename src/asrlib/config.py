@@ -57,6 +57,9 @@ class FrontEndConfig:
     kind: ClassVar[str] = "base"
     _by_kind: ClassVar[dict[str, type]] = {}
 
+    # {field: value} for fields added later: what configs saved before them implicitly used
+    LEGACY_DEFAULTS: ClassVar[dict] = {}
+
     def __init_subclass__(cls, **kwargs):
         # Every subclass registers itself, so from_dict() can find it by its `kind`
         super().__init_subclass__(**kwargs)
@@ -74,6 +77,11 @@ class FrontEndConfig:
     def from_dict(d: dict) -> "FrontEndConfig":
         d = dict(d)
         cls = FrontEndConfig._by_kind[d.pop("kind")]
+
+        # Fields added after models were saved: an old config without them gets the value it USED,
+        # not today's default, so an old model reloads with the features it was trained on
+        for key, value in cls.LEGACY_DEFAULTS.items():
+            d.setdefault(key, value)
         return cls(**d)
 
     def cache_dict(self) -> dict:
@@ -129,6 +137,7 @@ class CarfacConfig(FrontEndConfig):
         CarfacConfig(ihc_params={"ihc_style": "one_cap"})      # v1 inner hair cell
         CarfacConfig(open_loop=True)                           # no AGC ("carfac-noagc")
         CarfacConfig(post="cuberoot")                          # same cache, different compression
+        CarfacConfig(pooling="box10")                          # the original 10 ms box pooling
 
     The one default that differs from CARFAC's: agc decimation (6, 2, 2, 2) instead of (8, 2, 2, 2).
     It keeps the AGC spatial smoother at 3 taps at 16 kHz, which is the only case the JAX port
@@ -140,6 +149,9 @@ class CarfacConfig(FrontEndConfig):
     """
     kind: ClassVar[str] = "carfac"
 
+    # Configs saved before `pooling` existed were all pooled with the 10 ms box
+    LEGACY_DEFAULTS: ClassVar[dict] = {"pooling": "box10"}
+
     # Cochlea design, grouped and named as in CARFAC
     car_params: dict = field(default_factory=dict)
     agc_params: dict = field(default_factory=lambda: {"decimation": (6, 2, 2, 2)})
@@ -147,6 +159,12 @@ class CarfacConfig(FrontEndConfig):
 
     # Run option, same name as CARFAC's run_segment(open_loop=...)
     open_loop: bool = False
+
+    # How the 16 kHz NAP becomes 100 frames/s (part of the cache key: changing it re-extracts):
+    #   "hann25"  25 ms Hann window every 10 ms, centred like log-mel's frames: the same time
+    #             integration as the mel baseline, so it isn't a confound
+    #   "box10"   plain mean over each 10 ms block, no overlap (the original asrlib pooling)
+    pooling: Literal["hann25", "box10"] = "hann25"
 
     # Applied when features are LOADED, so they're not part of the cache key
     post: Literal["log", "cuberoot", "none"] = field(default="log", metadata={"cache": False})
@@ -156,6 +174,8 @@ class CarfacConfig(FrontEndConfig):
         # Literal types aren't enforced by Python, so check the one we change often
         if self.post not in ("log", "cuberoot", "none"):
             raise ValueError(f"post must be 'log', 'cuberoot' or 'none', not {self.post!r}")
+        if self.pooling not in ("hann25", "box10"):
+            raise ValueError(f"pooling must be 'hann25' or 'box10', not {self.pooling!r}")
 
         # JSON turns tuples into lists; convert back so a reloaded config equals the original
         for group in ("car_params", "agc_params", "ihc_params"):
@@ -163,7 +183,9 @@ class CarfacConfig(FrontEndConfig):
 
     @property
     def name(self) -> str:
-        return f"carfac-{'noagc' if self.open_loop else 'agc'}-{self.post}"
+        # The default pooling stays out of the name; the original box pooling is marked
+        box = "-box10" if self.pooling == "box10" else ""
+        return f"carfac-{'noagc' if self.open_loop else 'agc'}-{self.post}{box}"
 
     def cache_key(self) -> str:
         # The CARFAC commit is part of the key: a new CARFAC version means new features
@@ -177,11 +199,11 @@ class CarfacConfig(FrontEndConfig):
 class ModelConfig:
     """Acoustic model architecture. `arch` is a registry name; the rest are its kwargs."""
     arch: str = "transformer_ctc"
-    d_model: int = 256
-    n_heads: int = 4
+    d_model: int = 384
+    n_heads: int = 6
     n_layers: int = 6
-    d_ff: int = 1024
-    dropout: float = 0.1
+    d_ff: int = 1536
+    dropout: float = 0.05
     subsample_channels: int = 128
     subsample_factor: int = 4
 
@@ -215,8 +237,8 @@ class TrainConfig:
     """The training recipe. It's part of the model's identity: same config, same model."""
     epochs: int = 40
     peak_lr: float = 1e-3
-    warmup_steps: int = 1000
-    weight_decay: float = 0.01
+    warmup_steps: int = 2000
+    weight_decay: float = 0.1
     max_frames_per_batch: int = 40_000      # length-bucketed batches, ≈ 400 s of audio
     grad_clip: float = 1.0
     amp: Literal["auto", "bf16", "fp16", "off"] = "auto"
@@ -228,7 +250,7 @@ class TrainConfig:
     train_conditions: tuple[Condition, ...] = (CLEAN,)   # Phase 2: add noisy training conditions
     n_noisy_variants: int = 0               # Phase 2: K cached noisy copies per utterance
     early_stop_patience: int | None = 8
-    num_workers: int = 4
+    num_workers: int = 2
 
     @property
     def noise_tag(self) -> str:
@@ -249,7 +271,7 @@ class ASRConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
-    norm: Literal["utt_cmvn", "none"] = "utt_cmvn"
+    norm: Literal["utt_cmvn", "global", "none"] = "global"
     tokenizer: str = "char"
     seed: int = 0
 

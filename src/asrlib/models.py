@@ -73,6 +73,42 @@ class ConvSubsampleAndProject(nn.Module):
         return self.proj(x), conv_out_len(lengths, self.n_convs)                 # (B, T', d_model), (B,)
 
 
+class Conv1dSubsampleAndProject(nn.Module):
+    """Whisper-style stem: the features are input CHANNELS and the convs slide over time only.
+
+    It makes no assumption about the feature axis, so it suits any front end: tonotopic ones
+    (log-mel, CARFAC) and non-tonotopic ones (MFCC, whose coefficients have no "neighbours").
+    Its size barely depends on n_feats (only the first conv's input width), unlike the Conv2d
+    stem, whose projection grows with n_feats.
+
+    (B, T, F) → (B, T / factor, d_model). Stride 2 in every conv (Whisper strides only its second
+    conv) to keep the same x4 subsampling as the Conv2d stem. `channels` is unused: every conv is d_model wide.
+    """
+
+    def __init__(self, n_feats: int, d_model: int, channels: int | None = None, factor: int = 4):
+        super().__init__()
+
+        # One stride-2 conv per halving: factor 4 → 2 convs
+        self.n_convs = int(math.log2(factor))
+        if 2 ** self.n_convs != factor:
+            raise ValueError(f"subsample_factor must be a power of 2, not {factor}")
+
+        # Conv -> GELU, repeated; the first conv maps n_feats channels to d_model
+        layers, c_in = [], n_feats
+        for _ in range(self.n_convs):
+            layers += [nn.Conv1d(c_in, d_model, kernel_size=3, stride=2, padding=1), nn.GELU()]
+            c_in = d_model
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.conv(x.transpose(1, 2)).transpose(1, 2)                         # (B, F, T) → (B, T', d_model)
+        return x, conv_out_len(lengths, self.n_convs)                            # (B, T', d_model), (B,)
+
+
+# Stems by name: TransformerCTC picks one through its STEM class attribute
+STEMS = {"conv2d": ConvSubsampleAndProject, "conv1d": Conv1dSubsampleAndProject}
+
+
 class PositionalEncoding(nn.Module):
     """Fixed sinusoidal positions (Vaswani et al., 2017), added to every frame, then dropout."""
 
@@ -133,10 +169,15 @@ class TransformerCTC(AcousticModel):
     """ConvSubsample(x4) -> sinusoidal positions -> Pre-LN Transformer encoder -> Linear -> log-softmax.
 
     `arch` is accepted and ignored so _build_model can pass every ModelConfig field at once.
-    """
 
-    def __init__(self, n_feats: int, vocab_size: int, d_model=256, n_heads=4, n_layers=6,
-                 d_ff=1024, dropout=0.1, subsample_channels=128, subsample_factor=4,
+    STEM selects the subsampling stem. It's a class attribute, not a ModelConfig field, so configs
+    (and the hashes of models already trained) don't change: "transformer_ctc" keeps the Conv2d stem,
+    "transformer_ctc_conv1d" (below) is the same model with the Conv1d stem.
+    """
+    STEM = "conv2d"
+
+    def __init__(self, n_feats: int, vocab_size: int, d_model=384, n_heads=6, n_layers=6,
+                 d_ff=1536, dropout=0.05, subsample_channels=128, subsample_factor=4,
                  blank_id: int = 0, arch=None):
         super().__init__()
         if d_model % n_heads:
@@ -147,7 +188,7 @@ class TransformerCTC(AcousticModel):
         self.blank_id = blank_id
 
         # 1) Time / subsample_factor, and features -> d_model
-        self.subsample = ConvSubsampleAndProject(n_feats, d_model, subsample_channels, subsample_factor)
+        self.subsample = STEMS[self.STEM](n_feats, d_model, subsample_channels, subsample_factor)
 
         # 2) Position codes
         self.pos = PositionalEncoding(d_model, dropout=dropout)
@@ -208,3 +249,12 @@ class TransformerCTC(AcousticModel):
             ids = torch.unique_consecutive(seq[:n])
             hyps.append(ids[ids != self.blank_id].tolist())
         return hyps
+
+
+@register("model", "transformer_ctc_conv1d")
+class TransformerCTCConv1d(TransformerCTC):
+    """TransformerCTC with the Whisper-style Conv1d stem: the fair choice when MFCC is in the comparison.
+
+        ModelConfig(arch="transformer_ctc_conv1d", ...)     # every other field works the same
+    """
+    STEM = "conv1d"

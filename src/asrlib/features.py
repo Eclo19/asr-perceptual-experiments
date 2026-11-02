@@ -24,23 +24,47 @@ from .frontends import FrontEnd
 
 
 class Normalizer:
-    """Feature normalization after post(). 'utt_cmvn' = per-utterance, per-channel mean/variance.
+    """Feature normalization after post(), per channel.
 
-    It's stateless, so there's nothing to save. A future 'global' mode would store its
-    statistics in state_dict(), and load() would restore them.
+        "utt_cmvn"  each utterance's own mean/std (stateless). Removes any constant offset in the
+                    log domain, so it also removes overall GAIN for log-mel and MFCC: they become
+                    level-invariant by normalization, not by design.
+        "global"    one fixed mean/std per channel, measured once on the training data (set_stats).
+                    A level or noise change reaches the model exactly as the front end outputs it,
+                    so level and noise experiments test the front end itself.
+        "none"      features as they come out of post().
     """
-    MODES = ("utt_cmvn", "none")
+    MODES = ("utt_cmvn", "global", "none")
 
-    def __init__(self, mode: Literal["utt_cmvn", "none"] = "utt_cmvn"):
+    def __init__(self, mode: Literal["utt_cmvn", "global", "none"] = "utt_cmvn"):
         # Fail on a typo, not halfway through training
         if mode not in self.MODES:
             raise ValueError(f"norm must be one of {self.MODES}, not {mode!r}")
         self.mode = mode
 
+        # Global statistics, f32[F] each; set by set_stats() or load_state_dict()
+        self.mean: torch.Tensor | None = None
+        self.std: torch.Tensor | None = None
+
+    @property
+    def is_fitted(self) -> bool:
+        """True when the normalizer can run: always, except 'global' before its statistics are set."""
+        return self.mode != "global" or self.mean is not None
+
+    def set_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        """Fix the global per-channel statistics, f32[F] each."""
+        self.mean, self.std = mean.float().cpu(), std.float().cpu()
+
     def __call__(self, feats: torch.Tensor) -> torch.Tensor:
         """(T, F) for ONE utterance → (T, F). Must run before padding, on real frames only."""
         if self.mode == "none":
             return feats
+
+        if self.mode == "global":
+            if self.mean is None:
+                raise RuntimeError("Global normalization has no statistics yet. ASR computes them from "
+                                   "the training data on first use, and load() restores them.")
+            return (feats - self.mean) / (self.std + 1e-5)        # (T, F) - (F,), broadcast
 
         # Z-score each channel over time; correction=0 keeps one-frame utterances finite
         mean = feats.mean(dim=0, keepdim=True)                     # (1, F)
@@ -48,7 +72,14 @@ class Normalizer:
         return (feats - mean) / (std + 1e-5)                       # (T, F): mean 0, std 1 per channel
 
     def state_dict(self) -> dict:
-        return {"mode": self.mode}
+        # Tensors (not lists), so torch.load(weights_only=True) reads them back
+        return {"mode": self.mode, "mean": self.mean, "std": self.std}
+
+    def load_state_dict(self, state: dict) -> None:
+        if state["mode"] != self.mode:
+            raise ValueError(f"Checkpoint normalizer is {state['mode']!r}, config says {self.mode!r}")
+        if state.get("mean") is not None:
+            self.set_stats(state["mean"], state["std"])
 
 
 class Featurizer:
