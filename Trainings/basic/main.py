@@ -107,7 +107,7 @@ MODEL = ModelConfig(
 
 # ---- Training recipe 
 TRAIN = TrainConfig(
-    epochs=75,
+    epochs=60,
     peak_lr=1e-3,
     warmup_steps=1000,
     weight_decay=0.01,
