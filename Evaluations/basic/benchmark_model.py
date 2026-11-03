@@ -48,7 +48,7 @@ sys.stdout.reconfigure(line_buffering=True)
 # =============================================================================
 
 # The model: a .pt file, a _meta.json file, or a model name (looked up in <ROOT>/models/)
-MODEL = "models/2026-11-01_logmel80_librispeech-train.100_clean_s25_218a62_meta.json"
+MODEL = "models/2026-11-03_carfac-agc-log_librispeech-train.100_clean_s25_af2b85_meta.json"
 
 # Workspace root. None: the folder that holds models/ (inferred from MODEL), else the current folder
 ROOT = None
@@ -377,6 +377,8 @@ def plot_sweep(df: pd.DataFrame, x: str, group: str | None, clean_wer: float,
 # =============================================================================
 
 def main():
+
+    print("\nStarting evaluation and benchmarking...\n")
     pt_path, root = resolve_model(MODEL, ROOT)
     device = pick_device(DEVICE)
 

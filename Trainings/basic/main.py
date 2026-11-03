@@ -21,6 +21,7 @@ Date: 11/01/2026
 
 import sys
 from pathlib import Path
+import math
 
 from asrlib import ASR, ASRConfig, CLEAN, DataConfig, LogMelConfig, ModelConfig, TrainConfig, CarfacConfig
 
@@ -51,14 +52,30 @@ DEVICE = None # will try cuda first
 
 # ---- Front end: 80 log-mel bins, 25 ms windows (n_fft rounded up to 512), 10 ms hop
 logmel_fe = LogMelConfig(
-    n_mels=80,
-    win_ms=25.0,
-    log_eps=1e-6,
+    n_mels=80
 )
 
-# Default CARFAC
+car_params = {
+    "velocity_scale": 0.1,                   # For the velocity nonlinearity
+    "v_offset": 0.04,                        # Offset gives a quadratic part
+    "min_zeta": 0.10,                        # Minimum damping factor in mid-freq channels
+    "max_zeta": 0.35,                        # Maximum damping factor in mid-freq channels
+    "first_pole_theta": 0.95 * math.pi,      # Highest pole freq in fs units (0.85π → 6.8 kHz, 0.95π → 7.6 kHz)
+    "zero_ratio": math.sqrt(2),              # How far zero is above pole
+    "high_f_damping_compression": 0.5,       # 0 to 1 to compress zeta
+    "erb_per_step": 0.42,                   # G&M's ERB formula (at 0.85π: 0.5 → 65, 0.405 → 80)
+    "min_pole_hz": 30,
+    "erb_break_freq": 165.3,                 # Greenwood map's break freq
+    "erb_q": 1000 / (24.7 * 4.37),           # Glasberg and Moore's high-cf ratio
+    "ac_corner_hz": 20,                      # AC couple at 20 Hz corner
+    "high_f_factor": 0.0,                    # Factor to include more high frequency channels
+}
+
+# CARFAC
 carfac_fe = CarfacConfig(
-    post="cuberoot"
+    car_params=car_params,
+    post="log", 
+    pooling="hann25",
 )
 
 FRONTEND = carfac_fe
@@ -78,12 +95,12 @@ DATA = DataConfig(
 
 # ---- Model: Transformer-CTC (≈ 5.55 M parameters with 80 mel bins)
 MODEL = ModelConfig(
-    arch="transformer_ctc",
+    arch="transformer_ctc_conv1d", # "transformer_ctc", "transformer_ctc_conv1d"
     d_model=384,
     n_heads=6,
-    n_layers=4,
-    d_ff=1024,
-    dropout=0.1,
+    n_layers=6,
+    d_ff=1536,
+    dropout=0.05,
     subsample_channels=128,
     subsample_factor=4,
 )
@@ -94,7 +111,7 @@ TRAIN = TrainConfig(
     peak_lr=1e-3,
     warmup_steps=1000,
     weight_decay=0.01,
-    max_frames_per_batch=160_000,          # ≈ 1,600 s of audio per batch ≈ the notebook's 128 utterances
+    max_frames_per_batch=40_000,          
     grad_clip=1.0,
     amp="auto",                            # automatic mix precision choice. 
     specaugment={"freq_masks": 2, "freq_width": 15, "time_masks": 2, "time_width": 40,
@@ -106,7 +123,7 @@ TRAIN = TrainConfig(
 )
 
 SEED = 25                                  # the notebook's seed
-NORM = "utt_cmvn"                          # per-utterance mean/variance normalization
+NORM = "global"                            # 
 
 
 # =============================================================================
