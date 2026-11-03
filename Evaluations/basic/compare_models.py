@@ -1,5 +1,5 @@
 """
-Compare two front ends condition by condition, with paired significance tests.
+Compare two front ends condition by condition, with paired significance tests and side-by-side plots.
 
 Set the globals below and press Run in VS Code (or `python compare_models.py`). Needs no GPU:
 it reads the per-utterance results that benchmark_model.py (or ASR.evaluate) already saved in
@@ -8,6 +8,8 @@ results/<name>/per_utt/<split>__<condition>.csv. Run benchmark_model.py on every
 For every condition that all models were scored on, it reports:
 
     WER of A and B, ΔWER = WER_A - WER_B with a 95% interval, and a two-sided p-value
+    PER of A and B and ΔPER, tested the same way (did the model hear the right sounds?)
+    the word errors of each side split into substitutions / deletions / insertions
 
 using the paired bootstrap (Bisani & Ney, 2004): resample the test UTTERANCES 1,000 times, score
 both systems on the same resampled set each time, and look at the spread of the difference.
@@ -16,13 +18,20 @@ Several seeds: list one model per seed on each side, in the same order (A[i] pai
 The pooled test resamples utterances once per draw and scores every seed on them, so it covers
 the test-set sampling; the per-seed signs show whether training randomness could flip the result.
 A claim needs both: every seed agrees on the sign, and the pooled p-value (Holm-corrected for the
-number of conditions) is below 0.05.
+number of conditions) is below 0.05. WER is the primary metric; PER is reported alongside.
 
-Outputs go to results/compare/<A>_vs_<B>_<split>/: comparison.csv, delta_vs_snr.png,
-delta_vs_level.png and report.txt.
+Results saved before PER existed are upgraded on the fly: S/D/I and PER are recomputed from their
+ref/hyp text (needs g2p_en: pip install --no-deps g2p_en nltk inflect). Nothing is rewritten on disk.
+
+Outputs go to results/compare/<A>_vs_<B>_<split>/:
+    comparison.csv                       every number in the tables below
+    wer_vs_snr.png, per_vs_snr.png       A and B on the same axes, one panel per noise
+    wer_vs_level.png, per_vs_level.png   A and B on the same axes
+    delta_vs_snr.png, delta_vs_level.png ΔWER with its 95% interval (below 0 = A better)
+    report.txt                           a copy of everything printed
 
 Author: Eric Oliveira
-Date: 11/02/2026
+Date: 11/02/2026 (PER, S/D/I and side-by-side plots: 11/03/2026)
 
 * Written with the help of Claude *
 
@@ -38,6 +47,8 @@ matplotlib.use("Agg")                      # Draw to files: works on Quest witho
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+from asrlib.metrics import _g2p, add_error_columns
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -117,11 +128,21 @@ def saved_conditions(root: Path, name: str, split: str) -> set[str]:
     return {p.stem.split("__", 1)[1] for p in folder.glob(f"{split}__*.csv")}
 
 
+_UPGRADED: list[str] = []                  # Tables that needed S/D/I or PER recomputed (reported once)
+
+
 def load_per_utt(root: Path, name: str, split: str, condition: str) -> pd.DataFrame:
-    """utt_id, w_err, w_ref (+ c_err, c_ref) for every utterance, sorted by utt_id."""
+    """Every utterance's error counts (words, characters, phonemes, S/D/I), sorted by utt_id."""
     path = root / "results" / name / "per_utt" / f"{split}__{condition}.csv"
-    df = pd.read_csv(path, dtype={"utt_id": str})
-    return df.sort_values("utt_id").reset_index(drop=True)
+
+    # keep_default_na=False: an empty hypothesis (the model output nothing) stays "", not NaN
+    df = pd.read_csv(path, dtype={"utt_id": str, "ref": str, "hyp": str}, keep_default_na=False)
+
+    # Older results lack S/D/I or PER: recompute them from the saved text
+    full = add_error_columns(df)
+    if full is not df:
+        _UPGRADED.append(f"{name}/{split}__{condition}")
+    return full.sort_values("utt_id").reset_index(drop=True)
 
 
 def parse_condition(name: str) -> dict:
@@ -142,40 +163,53 @@ def parse_condition(name: str) -> dict:
 # Statistics
 # =============================================================================
 
-def paired_stats(pairs: list[tuple[pd.DataFrame, pd.DataFrame]], n_boot: int, seed: int) -> dict:
-    """ΔWER = WER_A - WER_B over one or more seed pairs, with a paired bootstrap over utterances.
+def paired_stats(pairs: list[tuple[pd.DataFrame, pd.DataFrame]], n_boot: int, seed: int,
+                 err: str = "w_err", ref: str = "w_ref") -> dict:
+    """Error rate of A and B and their difference A - B, with a paired bootstrap over utterances.
 
+    err/ref pick the unit: ("w_err", "w_ref") = WER, ("p_err", "p_ref") = PER.
     Each draw resamples the utterances ONCE and scores every seed of both systems on them, so the
     comparison stays paired (same utterances for A and B) and the seeds are averaged, not pooled
-    as if they were extra utterances. With one pair this is exactly asrlib's paired_bootstrap.
+    as if they were extra utterances. With one pair, WER is exactly asrlib's paired_bootstrap.
     """
     # Line every seed up on the same utterances: (n_seeds, n_utts) error counts
     ids = pairs[0][0].utt_id.to_numpy()
     for a, b in pairs:
         if not (np.array_equal(a.utt_id, ids) and np.array_equal(b.utt_id, ids)):
             raise ValueError("Models were scored on different utterances; re-run their benchmarks")
-    err_a = np.stack([a.w_err.to_numpy() for a, _ in pairs]).astype(float)
-    err_b = np.stack([b.w_err.to_numpy() for _, b in pairs]).astype(float)
-    ref = pairs[0][0].w_ref.to_numpy().astype(float)
+    err_a = np.stack([a[err].to_numpy() for a, _ in pairs]).astype(float)
+    err_b = np.stack([b[err].to_numpy() for _, b in pairs]).astype(float)
+    n_ref = pairs[0][0][ref].to_numpy().astype(float)
 
-    # Corpus WER averaged over seeds: total errors / (seeds × total reference words)
-    def wer(err, idx=None):
+    # Corpus rate averaged over seeds: total errors / (seeds × total reference units)
+    def rate(e, idx=None):
         if idx is None:
-            return err.sum() / (len(err) * ref.sum())
-        return err[:, idx].sum(axis=(0, 2)) / (len(err) * ref[idx].sum(axis=1))
+            return e.sum() / (len(e) * n_ref.sum())
+        return e[:, idx].sum(axis=(0, 2)) / (len(e) * n_ref[idx].sum(axis=1))
 
     # Resample utterance indices: (n_boot, n_utts), the same rows for A and B
     rng = np.random.default_rng(seed)
-    idx = rng.integers(0, len(ref), size=(n_boot, len(ref)))
-    deltas = wer(err_a, idx) - wer(err_b, idx)
+    idx = rng.integers(0, len(n_ref), size=(n_boot, len(n_ref)))
+    boot_a, boot_b = rate(err_a, idx), rate(err_b, idx)
+    deltas = boot_a - boot_b
 
     # Per-seed differences: do all seeds agree on the sign?
-    per_seed = [(a.w_err.sum() - b.w_err.sum()) / ref.sum() for a, b in pairs]
-    lo, hi = np.quantile(deltas, [0.025, 0.975])
+    per_seed = [(a[err].sum() - b[err].sum()) / n_ref.sum() for a, b in pairs]
+    q = [0.025, 0.975]
     p = min(1.0, 2 * min((deltas <= 0).mean(), (deltas >= 0).mean()))
-    return {"wer_a": wer(err_a), "wer_b": wer(err_b), "delta": wer(err_a) - wer(err_b),
-            "delta_lo": lo, "delta_hi": hi, "p": p, "per_seed": per_seed,
+    return {"a": rate(err_a), "b": rate(err_b), "delta": rate(err_a) - rate(err_b),
+            "a_lo": np.quantile(boot_a, q[0]), "a_hi": np.quantile(boot_a, q[1]),
+            "b_lo": np.quantile(boot_b, q[0]), "b_hi": np.quantile(boot_b, q[1]),
+            "delta_lo": np.quantile(deltas, q[0]), "delta_hi": np.quantile(deltas, q[1]),
+            "p": p, "per_seed": per_seed,
             "seeds_agree": all(d > 0 for d in per_seed) or all(d < 0 for d in per_seed)}
+
+
+def error_types(frames: list[pd.DataFrame]) -> dict:
+    """Substitution / deletion / insertion rates (fractions of reference words), averaged over seeds."""
+    words = sum(f.w_ref.sum() for f in frames)
+    return {k: sum(f[c].sum() for f in frames) / words
+            for k, c in (("sub", "w_sub"), ("del", "w_del"), ("ins", "w_ins"))}
 
 
 def holm(p_values: list[float]) -> list[float]:
@@ -193,6 +227,37 @@ def holm(p_values: list[float]) -> list[float]:
 # Plots
 # =============================================================================
 
+def plot_two_curves(df: pd.DataFrame, metric: str, x: str, group: str | None, labels: tuple[str, str],
+                    clean: pd.Series | None, xlabel: str, out: Path, reverse_x: bool = False) -> None:
+    """A and B on the same axes, one panel per noise (or one panel for the level sweep).
+
+    metric "wer" or "per": columns <metric>_a / <metric>_b with their 95% bootstrap intervals.
+    Dashed lines: each system's clean score, the reference both curves start from.
+    """
+    groups = list(df.groupby(group, sort=False)) if group else [(None, df)]
+    fig, axes = plt.subplots(1, len(groups), figsize=(6 * len(groups), 4.5), squeeze=False, sharey=True)
+    colors = ("tab:blue", "tab:orange")
+    for ax, (name, g) in zip(axes[0], groups):
+        g = g.sort_values(x)
+        for side, label, color, marker in (("a", labels[0], colors[0], "o"), ("b", labels[1], colors[1], "s")):
+            y = g[f"{metric}_{side}"] * 100
+            err = np.vstack([y - g[f"{metric}_{side}_lo"] * 100, g[f"{metric}_{side}_hi"] * 100 - y])
+            ax.errorbar(g[x], y, yerr=err, marker=marker, color=color, capsize=3, label=label)
+            if clean is not None:
+                ax.axhline(clean[f"{metric}_{side}"] * 100, color=color, ls="--", lw=1, alpha=0.7,
+                           label=f"{label}, clean ({clean[f'{metric}_{side}']:.1%})")
+        if reverse_x:
+            ax.invert_xaxis()                # High SNR (easy) on the left, as in most papers
+        title = f"{metric.upper()}" + (f": {name} noise" if name else "")
+        ax.set(xlabel=xlabel, title=title)
+        ax.grid(alpha=0.3)
+    axes[0][0].set_ylabel(f"{metric.upper()} (%)")
+    axes[0][-1].legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+
+
 def plot_delta(df: pd.DataFrame, x: str, group: str | None, xlabel: str, title: str,
                out: Path, reverse_x: bool = False) -> None:
     """ΔWER with its 95% interval; below zero = A better, above zero = B better."""
@@ -200,8 +265,8 @@ def plot_delta(df: pd.DataFrame, x: str, group: str | None, xlabel: str, title: 
     groups = df.groupby(group, sort=False) if group else [("clean speech", df)]
     for label, g in groups:
         g = g.sort_values(x)
-        y = g.delta * 100
-        err = np.vstack([y - g.delta_lo * 100, g.delta_hi * 100 - y])
+        y = g.wer_delta * 100
+        err = np.vstack([y - g.wer_delta_lo * 100, g.wer_delta_hi * 100 - y])
         ax.errorbar(g[x], y, yerr=err, marker="o", capsize=3, label=label)
     ax.axhline(0, color="gray", lw=1)
     if reverse_x:
@@ -257,6 +322,7 @@ def main():
             print(f"  WARNING: {message}")
         else:
             print(f"  controlled hash {hashes.pop()}: comparable")
+        print(f"  PER: {'on (g2p_en)' if _g2p() is not None else 'off: pip install --no-deps g2p_en nltk inflect'}")
 
         # Conditions every model has results for
         names = [n for n, _ in a_models + b_models]
@@ -268,19 +334,29 @@ def main():
         if not conditions:
             sys.exit("No condition was scored for every model. Run benchmark_model.py on each model first.")
 
-        # One paired test per condition
+        # One paired test per condition, for WER (primary) and PER
         rows = []
         for cond in conditions:
             pairs = [(load_per_utt(root, na, SPLIT, cond), load_per_utt(root, nb, SPLIT, cond))
                      for (na, _), (nb, _) in zip(a_models, b_models)]
-            stats = paired_stats(pairs, N_BOOT, BOOT_SEED)
-            rows.append({"condition": cond, **parse_condition(cond), **stats})
+            row = {"condition": cond, **parse_condition(cond)}
+            row.update({f"wer_{k}": v for k, v in paired_stats(pairs, N_BOOT, BOOT_SEED).items()})
+            has_per = all(f.p_err.notna().all() for pair in pairs for f in pair)
+            if has_per:
+                row.update({f"per_{k}": v for k, v in
+                            paired_stats(pairs, N_BOOT, BOOT_SEED, err="p_err", ref="p_ref").items()})
+            row.update({f"{k}_a": v for k, v in error_types([a for a, _ in pairs]).items()})
+            row.update({f"{k}_b": v for k, v in error_types([b for _, b in pairs]).items()})
+            rows.append(row)
 
         df = pd.DataFrame(rows)
-        df["p_holm"] = holm(df.p.tolist())
+        has_per = "per_a" in df and df.per_a.notna().all()
+        df["wer_p_holm"] = holm(df.wer_p.tolist())
+        if has_per:
+            df["per_p_holm"] = holm(df.per_p.tolist())
         df["verdict"] = np.where(
-            (df.p_holm < 0.05) & df.seeds_agree,
-            np.where(df.delta < 0, f"{label_a} better", f"{label_b} better"),
+            (df.wer_p_holm < 0.05) & df.wer_seeds_agree,
+            np.where(df.wer_delta < 0, f"{label_a} better", f"{label_b} better"),
             "no clear difference")
 
         # Order: clean first, then each noise by SNR (high to low), then the level sweep
@@ -288,33 +364,63 @@ def main():
         df = df.sort_values(["_kind", "noise", "snr_db", "speech_db_spl"],
                             ascending=[True, True, False, True], na_position="first").drop(columns="_kind")
 
-        print(f"\n{'condition':22s} {'WER A':>7s} {'WER B':>7s} {'ΔWER':>7s} {'95% CI of Δ':>17s} "
+        if _UPGRADED:
+            print(f"  Recomputed S/D/I and PER from saved text for {len(_UPGRADED)} older result table(s) "
+                  "(re-run benchmark_model.py to store them)")
+
+        # ---- Table 1: WER, the primary metric
+        print(f"\nWER   (A = {label_a}, B = {label_b})")
+        print(f"{'condition':22s} {'A':>7s} {'B':>7s} {'ΔWER':>7s} {'95% CI of Δ':>17s} "
               f"{'p':>6s} {'p_holm':>7s} {'seeds':>6s}  verdict")
         for _, r in df.iterrows():
-            agree = "agree" if r.seeds_agree else "split"
-            print(f"{r.condition:22s} {r.wer_a:7.2%} {r.wer_b:7.2%} {r.delta * 100:+6.2f}  "
-                  f"[{r.delta_lo * 100:+6.2f}, {r.delta_hi * 100:+6.2f}] {r.p:6.3f} {r.p_holm:7.3f} "
-                  f"{agree:>6s}  {r.verdict}")
-        print("\nΔWER in percentage points; negative = A better. A difference counts only when every seed "
-              "agrees on its sign and p_holm < 0.05.")
+            agree = "agree" if r.wer_seeds_agree else "split"
+            print(f"{r.condition:22s} {r.wer_a:7.2%} {r.wer_b:7.2%} {r.wer_delta * 100:+6.2f}  "
+                  f"[{r.wer_delta_lo * 100:+6.2f}, {r.wer_delta_hi * 100:+6.2f}] {r.wer_p:6.3f} "
+                  f"{r.wer_p_holm:7.3f} {agree:>6s}  {r.verdict}")
+
+        # ---- Table 2: PER and how the word errors split
+        print(f"\nPER and word error types (S/D/I, % of reference words; they add up to WER)")
+        print(f"{'condition':22s} {'PER A':>7s} {'PER B':>7s} {'ΔPER':>7s} {'p_holm':>7s}   "
+              f"{'A: S / D / I':>18s}   {'B: S / D / I':>18s}")
+        for _, r in df.iterrows():
+            per_txt = (f"{r.per_a:7.2%} {r.per_b:7.2%} {r.per_delta * 100:+6.2f}  {r.per_p_holm:7.3f}"
+                       if has_per else f"{'—':>7s} {'—':>7s} {'—':>7s} {'—':>7s}")
+            types = [f"{r[f'sub_{s}'] * 100:5.1f} /{r[f'del_{s}'] * 100:5.1f} /{r[f'ins_{s}'] * 100:5.1f}"
+                     for s in ("a", "b")]
+            print(f"{r.condition:22s} {per_txt}   {types[0]:>18s}   {types[1]:>18s}")
+
+        print("\nΔ in percentage points; negative = A better. A WER difference counts only when every "
+              "seed agrees on its sign and p_holm < 0.05.")
         if len(a_models) == 1:
             print("One seed per side: the test covers which utterances were tested, not training randomness.")
 
         # Save the table (per-seed deltas as text, so the CSV stays flat)
-        df.assign(per_seed=df.per_seed.apply(lambda d: ";".join(f"{x:+.4f}" for x in d))) \
-          .to_csv(out / "comparison.csv", index=False)
+        flat = df.copy()
+        for col in [c for c in flat.columns if c.endswith("per_seed")]:
+            flat[col] = flat[col].apply(lambda d: ";".join(f"{x:+.4f}" for x in d))
+        flat.to_csv(out / "comparison.csv", index=False)
 
-        # Plots: Δ vs SNR per noise, Δ vs speech level
+        # ---- Plots: both systems on the same axes, then the differences
+        clean = df[df.condition == "clean"].iloc[0] if (df.condition == "clean").any() else None
         noisy = df[df.noise.notna() & (df.speech_db_spl == 65)]
+        levels = df[df.noise.isna()]
+        for metric in ("wer", "per") if has_per else ("wer",):
+            if not noisy.empty:
+                plot_two_curves(noisy, metric, "snr_db", "noise", (label_a, label_b), clean, "SNR (dB)",
+                                out / f"{metric}_vs_snr.png", reverse_x=True)
+            if len(levels) > 1:
+                plot_two_curves(levels, metric, "speech_db_spl", None, (label_a, label_b), None,
+                                "speech level (dB SPL)", out / f"{metric}_vs_level.png")
         if not noisy.empty:
             plot_delta(noisy, "snr_db", "noise", "SNR (dB)", f"ΔWER, {label_a} − {label_b}",
                        out / "delta_vs_snr.png", reverse_x=True)
-        levels = df[df.noise.isna()]
         if len(levels) > 1:
             plot_delta(levels, "speech_db_spl", None, "speech level (dB SPL)",
                        f"ΔWER, {label_a} − {label_b}", out / "delta_vs_level.png")
 
         print(f"\nSaved to {out}")
+        for f in sorted(out.iterdir()):
+            print(f"  {f.name}")
     finally:
         sys.stdout = tee.stream
         (out / "report.txt").write_text("".join(tee.lines))

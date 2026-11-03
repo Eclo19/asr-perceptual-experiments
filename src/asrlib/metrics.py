@@ -3,6 +3,10 @@ Metrics for the model + front end's performance. This is what quantifies the exp
 Quantify errors in both words and chars units.
 
     WER / CER          how many words / characters the recognizer got wrong (corpus level)
+    S / D / I          the word errors split into substitutions, deletions and insertions
+    PER                phoneme error rate: did the model hear the right SOUNDS? A misspelling such as
+                       "medisene" for "medicine" is a whole wrong word for WER but only 2 of 7 phonemes
+                       for PER. Text → phonemes with g2p_en (CMUdict, plus a neural guess for words not in it)
     bootstrap_ci       how much that number could move with a different test set of the same kind
     paired_bootstrap   whether front end A really beats front end B on the same utterances
 
@@ -19,6 +23,9 @@ Date: 10/29/2026
 from __future__ import annotations
 
 import dataclasses
+import functools
+import re
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Literal, Sequence
 
@@ -53,25 +60,130 @@ def _units(text: str, unit: Literal["word", "char"]) -> list[str]:
     return text.split() if unit == "word" else list(text)
 
 
+def edit_ops(ref: Sequence, hyp: Sequence) -> tuple[int, int, int]:
+    """The same minimum edits as edit_distance, split into (substitutions, deletions, insertions).
+
+    Each DP cell keeps (total, S, D, I) along its best path. On a tie, a substitution is preferred
+    over a deletion, and a deletion over an insertion (the usual convention, as in sclite), so
+    S + D + I always equals edit_distance(ref, hyp).
+    """
+    # prev[j] = best (total, S, D, I) for the first i-1 ref units and the first j hyp units
+    prev = [(j, 0, 0, j) for j in range(len(hyp) + 1)]                     # j insertions
+    for i, r in enumerate(ref, start=1):
+        cur = [(i, 0, i, 0)]                                                # i deletions
+        for j, h in enumerate(hyp, start=1):
+            t, s_, d, n = prev[j - 1]
+            miss = int(r != h)
+            sub = (t + miss, s_ + miss, d, n)                               # substitution (free on a match)
+            t, s_, d, n = prev[j]
+            dele = (t + 1, s_, d + 1, n)                                    # ref unit the hyp missed
+            t, s_, d, n = cur[j - 1]
+            ins = (t + 1, s_, d, n + 1)                                     # extra hyp unit
+            # min() returns the FIRST minimum: substitution, then deletion, then insertion
+            cur.append(min(sub, dele, ins, key=lambda c: c[0]))
+        prev = cur
+    _, s_, d, n = prev[-1]
+    return s_, d, n
+
+
+# ==============================
+# Phonemes (for PER)
+# ==============================
+
+_G2P = None
+_G2P_FAILED = False
+
+
+def _g2p():
+    """The g2p_en converter, created once. None (with one warning) if g2p_en can't be used here.
+
+    Install: pip install --no-deps g2p_en nltk inflect
+    (--no-deps: g2p_en lists the old `distance` package, which fails to build and isn't used at runtime)
+    """
+    global _G2P, _G2P_FAILED
+    if _G2P is None and not _G2P_FAILED:
+        try:
+            import nltk
+            # CMUdict is all we use from NLTK: download it once if it's missing
+            try:
+                nltk.data.find("corpora/cmudict")
+            except LookupError:
+                nltk.download("cmudict", quiet=True)
+            from g2p_en import G2p
+            _G2P = G2p()
+        except Exception as e:                                                # noqa: BLE001
+            _G2P_FAILED = True
+            warnings.warn(f"PER disabled: g2p_en isn't usable here ({type(e).__name__}: {e}). "
+                          "Install with: pip install --no-deps g2p_en nltk inflect")
+    return _G2P
+
+
+@functools.lru_cache(maxsize=None)
+def word_phonemes(word: str) -> tuple[str, ...]:
+    """One word → its phonemes without stress marks: "medicine" → (M, EH, D, AH, S, AH, N).
+
+    Known words come from CMUdict (first pronunciation); anything else, misspellings included, from
+    g2p_en's neural model (a guess). Stress digits are dropped, so AH0 and AH1 are the same sound.
+    Cached: each distinct word is converted once per process.
+    """
+    g = _g2p()
+    prons = g.cmu.get(word)
+    seq = prons[0] if prons else g.predict(word)
+    return tuple(re.sub(r"\d", "", p) for p in seq)
+
+
+def phonemes(text: str) -> list[str] | None:
+    """A normalized transcript → one phoneme sequence (word boundaries dropped: "as part" and
+    "aspart" sound alike). None when g2p_en isn't available."""
+    if _g2p() is None:
+        return None
+    return [p for w in text.split() for p in word_phonemes(w)]
+
+
 # ==============================
 # Scores
 # ==============================
 
-def utterance_errors(utt_ids: Sequence[str], refs: Sequence[str], hyps: Sequence[str]) -> pd.DataFrame:
-    """One row per utterance: its error counts and reference lengths, in words and characters.
+def _error_counts(ref: str, hyp: str, with_phonemes: bool = True) -> dict:
+    """All per-utterance counts for one (ref, hyp) pair."""
+    ref_w, hyp_w = _units(ref, "word"), _units(hyp, "word")
+    s_, d, n = edit_ops(ref_w, hyp_w)
+    out = {"w_err": s_ + d + n, "w_ref": len(ref_w), "w_sub": s_, "w_del": d, "w_ins": n,
+           "c_err": edit_distance(ref, hyp), "c_ref": len(ref)}
 
-    Keeping counts (not per-utterance rates) is what makes corpus WER and the bootstrap exact.
+    # PER: NaN when g2p_en isn't available, so scoring never fails because of it
+    ref_p = phonemes(ref) if with_phonemes else None
+    if ref_p is None:
+        out["p_err"], out["p_ref"] = np.nan, np.nan
+    else:
+        out["p_err"], out["p_ref"] = edit_distance(ref_p, phonemes(hyp)), len(ref_p)
+    return out
+
+
+def utterance_errors(utt_ids: Sequence[str], refs: Sequence[str], hyps: Sequence[str],
+                     with_phonemes: bool = True) -> pd.DataFrame:
+    """One row per utterance: error counts and reference lengths, in words, characters and phonemes.
+
+    Columns: utt_id, ref, hyp, w_err, w_ref, w_sub, w_del, w_ins, c_err, c_ref, p_err, p_ref.
+    Keeping counts (not per-utterance rates) is what makes corpus rates and the bootstrap exact.
     """
-    rows = []
-    for utt_id, ref, hyp in zip(utt_ids, refs, hyps, strict=True):
-        rows.append({
-            "utt_id": utt_id, "ref": ref, "hyp": hyp,
-            "w_err": edit_distance(_units(ref, "word"), _units(hyp, "word")),
-            "w_ref": len(_units(ref, "word")),
-            "c_err": edit_distance(ref, hyp),
-            "c_ref": len(ref),
-        })
+    rows = [{"utt_id": utt_id, "ref": ref, "hyp": hyp, **_error_counts(ref, hyp, with_phonemes)}
+            for utt_id, ref, hyp in zip(utt_ids, refs, hyps, strict=True)]
     return pd.DataFrame(rows)
+
+
+def add_error_columns(per_utt: pd.DataFrame) -> pd.DataFrame:
+    """Fill in S/D/I and phoneme columns missing from an older per-utterance table (e.g. a CSV
+    written before PER existed), recomputing them from its ref and hyp text. No model needed."""
+    needed = {"w_sub", "w_del", "w_ins", "p_err", "p_ref"}
+    if needed.issubset(per_utt.columns) and per_utt.p_err.notna().all():
+        return per_utt
+    df = per_utt.copy()
+    df["ref"], df["hyp"] = df.ref.fillna("").astype(str), df.hyp.fillna("").astype(str)
+    counts = pd.DataFrame([_error_counts(r, h) for r, h in zip(df.ref, df.hyp)], index=df.index)
+    for col in counts.columns:
+        df[col] = counts[col]
+    return df
 
 
 def error_rate(hyps: Sequence[str], refs: Sequence[str], unit: Literal["word", "char"] = "word") -> float:
@@ -92,18 +204,38 @@ class EvalResult:
     cer: float
     loss: float
     n_utts: int
-    per_utt: Any = None    # pandas DataFrame[utt_id, ref, hyp, w_err, w_ref, c_err, c_ref]
+    per_utt: Any = None    # pandas DataFrame: see utterance_errors() for the columns
     wer_ci: tuple[float, float] | None = None
+    per: float = float("nan")         # Phoneme error rate (NaN without g2p_en)
+    sub_rate: float = float("nan")    # Substitutions / reference words
+    del_rate: float = float("nan")    # Deletions / reference words
+    ins_rate: float = float("nan")    # Insertions / reference words (sub + del + ins = WER)
 
     @classmethod
     def from_utterances(cls, condition: str, utt_ids: Sequence[str], refs: Sequence[str],
                         hyps: Sequence[str], loss: float = float("nan"), ci: bool = True) -> EvalResult:
         """Score a whole test set: per-utterance table -> corpus WER/CER -> optional 95% CI."""
         per_utt = utterance_errors(utt_ids, refs, hyps)
+        result = cls.from_per_utt(condition, per_utt, loss=loss)
+        if ci:
+            result.wer_ci = bootstrap_ci(result)
+        return result
+
+    @classmethod
+    def from_per_utt(cls, condition: str, per_utt: pd.DataFrame, loss: float = float("nan"),
+                     ci: bool = False) -> EvalResult:
+        """Corpus scores from an existing per-utterance table (e.g. a saved CSV)."""
+        n_words = per_utt.w_ref.sum()
         result = cls(condition=condition,
-                     wer=float(per_utt.w_err.sum() / per_utt.w_ref.sum()),
+                     wer=float(per_utt.w_err.sum() / n_words),
                      cer=float(per_utt.c_err.sum() / per_utt.c_ref.sum()),
                      loss=loss, n_utts=len(per_utt), per_utt=per_utt)
+        if {"w_sub", "w_del", "w_ins"}.issubset(per_utt.columns):
+            result.sub_rate = float(per_utt.w_sub.sum() / n_words)
+            result.del_rate = float(per_utt.w_del.sum() / n_words)
+            result.ins_rate = float(per_utt.w_ins.sum() / n_words)
+        if "p_err" in per_utt.columns and per_utt.p_err.notna().all():
+            result.per = float(per_utt.p_err.sum() / per_utt.p_ref.sum())
         if ci:
             result.wer_ci = bootstrap_ci(result)
         return result

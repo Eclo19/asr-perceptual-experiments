@@ -14,6 +14,12 @@ below, then press Run in VS Code (or `python benchmark_model.py`). The script:
 
 Every evaluation is also recorded in models/<name>_meta.json and results/<name>/per_utt/.
 
+Metrics for every condition: WER (with a 95% bootstrap interval), CER, PER (phoneme error rate:
+did the model hear the right sounds, even when it misspelled the word?) and the word errors split
+into substitutions / deletions / insertions (S/D/I, which add up to WER). PER needs g2p_en:
+    pip install --no-deps g2p_en nltk inflect
+Without it, everything else still runs and PER shows as "—".
+
 Cost: log-mel and MFCC are computed on the fly, so each condition takes about a minute on a GPU.
 CARFAC needs a feature cache for EVERY condition (one full pass over test-clean, about 5.4 h of
 audio, each), so the full grid can take hours the first time; caches are reused afterwards.
@@ -38,6 +44,7 @@ import pandas as pd
 import torch
 
 from asrlib import ASR, CLEAN, Condition, NoiseBank
+from asrlib.metrics import _g2p
 
 # Print immediately, line by line, even into a Slurm log
 sys.stdout.reconfigure(line_buffering=True)
@@ -48,7 +55,7 @@ sys.stdout.reconfigure(line_buffering=True)
 # =============================================================================
 
 # The model: a .pt file, a _meta.json file, or a model name (looked up in <ROOT>/models/)
-MODEL = "models/2026-11-03_carfac-agc-log_librispeech-train.100_clean_s25_af2b85_meta.json"
+MODEL = "models/2026-11-03_logmel80_librispeech-train.100_clean_s30_3ba4e8_meta.json"
 
 # Workspace root. None: the folder that holds models/ (inferred from MODEL), else the current folder
 ROOT = None
@@ -131,6 +138,18 @@ def print_dict(d: dict, indent: int = 2, skip: tuple = ()) -> None:
     for k, v in d.items():
         if k not in skip:
             print(f"{' ' * indent}{k:<{width}}  {v}")
+
+
+def pct(x) -> str:
+    """0.1234 → '12.34%', NaN → '—' (PER without g2p_en)."""
+    return "—" if pd.isna(x) else f"{x:.2%}"
+
+
+def fmt_types(row) -> str:
+    """'S/D/I 20.1/5.3/1.2' (percent of reference words; they add up to WER)."""
+    if pd.isna(row.get("sub_rate")):
+        return ""
+    return f"S/D/I {row['sub_rate'] * 100:4.1f}/{row['del_rate'] * 100:4.1f}/{row['ins_rate'] * 100:4.1f}"
 
 
 def fmt_ci(row) -> str:
@@ -258,14 +277,22 @@ def clean_scores(asr: ASR) -> pd.DataFrame:
     for split in CLEAN_SPLITS:
         r = asr.evaluate(split=split, condition=asr.clean, max_utts=MAX_UTTS)
         lo, hi = r.wer_ci
-        print(f"\n  {split}: WER {r.wer:.2%}  (95% CI {lo:.2%}–{hi:.2%})  CER {r.cer:.2%}  "
+        print(f"\n  {split}: WER {r.wer:.2%}  (95% CI {lo:.2%}–{hi:.2%})  CER {r.cer:.2%}  PER {pct(r.per)}  "
               f"loss {r.loss:.3f}  over {r.n_utts} utterances")
+        print(f"    word errors            substitutions {r.sub_rate:.2%}, deletions {r.del_rate:.2%}, "
+              f"insertions {r.ins_rate:.2%}  (sum = WER)")
 
         # How the errors are spread over utterances
         per = r.per_utt.assign(utt_wer=lambda d: d.w_err / d.w_ref.clip(lower=1))
         print(f"    perfect utterances     {(per.w_err == 0).mean():.1%}")
         print(f"    median utterance WER   {per.utt_wer.median():.2%}")
         print(f"    utterances above 50%   {(per.utt_wer > 0.5).mean():.1%}")
+
+        # PER per utterance: how often the sounds were right even when the words weren't
+        if per.p_err.notna().all():
+            per = per.assign(utt_per=lambda d: d.p_err / d.p_ref.clip(lower=1))
+            print(f"    median utterance PER   {per.utt_per.median():.2%}  "
+                  f"(vs median WER {per.utt_wer.median():.2%}: the gap is mostly spelling)")
 
         # Only the test split gets examples, to keep the report readable
         if split == CLEAN_SPLITS[-1]:
@@ -280,7 +307,8 @@ def show_examples(per: pd.DataFrame) -> None:
     worst = per.sort_values(["utt_wer", "w_err"], ascending=False).head(N_EXAMPLES)
     print(f"\n    {N_EXAMPLES} worst utterances")
     for _, r in worst.iterrows():
-        print(f"      {r.utt_id}  WER {r.utt_wer:.0%} ({r.w_err}/{r.w_ref} words)")
+        per_txt = f", PER {r.utt_per:.0%}" if "utt_per" in r and pd.notna(r.utt_per) else ""
+        print(f"      {r.utt_id}  WER {r.utt_wer:.0%} ({r.w_err}/{r.w_ref} words){per_txt}")
         print(f"        ref: {r.ref[:110]}")
         print(f"        hyp: {r.hyp[:110]}")
 
@@ -326,7 +354,8 @@ def summarize_noise(noise: pd.DataFrame, clean_wer: float) -> None:
     for kind, group in noise.groupby("noise", sort=False):
         print(f"\n  {kind}")
         for _, r in group.sort_values("snr_db", ascending=False).iterrows():
-            print(f"    {r.snr_db:5g} dB   {fmt_ci(r)}   ×{r.wer / clean_wer:4.1f} clean")
+            print(f"    {r.snr_db:5g} dB   {fmt_ci(r)}   ×{r.wer / clean_wer:4.1f} clean   "
+                  f"PER {pct(r.per):>6s}   {fmt_types(r)}")
 
         # Two robustness numbers: where the error rate doubles, and how far down it stays usable
         g = group.sort_values("snr_db", ascending=False)
@@ -335,38 +364,73 @@ def summarize_noise(noise: pd.DataFrame, clean_wer: float) -> None:
         print(f"    WER doubles at {'≤ ' + format(doubled.max(), 'g') + ' dB' if len(doubled) else 'no SNR tested'}; "
               f"WER < 50% down to {format(usable.min(), 'g') + ' dB' if len(usable) else 'no SNR tested'}")
 
-    # One compact table: rows = noise, columns = SNR
-    table = noise.pivot_table(index="noise", columns="snr_db", values="wer", sort=False) * 100
-    table = table[sorted(table.columns, reverse=True)]
-    print("\n  WER % (columns: SNR in dB)")
-    print("  " + table.round(1).to_string().replace("\n", "\n  "))
+    # Compact tables: rows = noise, columns = SNR
+    for metric in ("wer", "per"):
+        if noise[metric].isna().all():
+            continue
+        table = noise.pivot_table(index="noise", columns="snr_db", values=metric, sort=False) * 100
+        table = table[sorted(table.columns, reverse=True)]
+        print(f"\n  {metric.upper()} % (columns: SNR in dB)")
+        print("  " + table.round(1).to_string().replace("\n", "\n  "))
 
 
 def summarize_levels(levels: pd.DataFrame, clean_wer: float) -> None:
     header("LEVEL SUMMARY: WER [95% CI] by speech level")
     for _, r in levels.sort_values("speech_db_spl").iterrows():
-        print(f"    {r.speech_db_spl:5g} dB SPL   {fmt_ci(r)}   ×{r.wer / clean_wer:4.1f} clean")
+        print(f"    {r.speech_db_spl:5g} dB SPL   {fmt_ci(r)}   ×{r.wer / clean_wer:4.1f} clean   "
+              f"PER {pct(r.per):>6s}   {fmt_types(r)}")
 
 
-def plot_sweep(df: pd.DataFrame, x: str, group: str | None, clean_wer: float,
+def plot_sweep(df: pd.DataFrame, x: str, group: str | None, clean: pd.Series,
                xlabel: str, title: str, out: Path, reverse_x: bool = False) -> None:
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    groups = df.groupby(group, sort=False) if group else [("clean speech", df)]
-    for label, g in groups:
-        g = g.sort_values(x)
-        y = g.wer * 100
-        # Error bars from the bootstrap interval, when it's there
-        if g.wer_lo.notna().all():
-            err = np.vstack([y - g.wer_lo * 100, g.wer_hi * 100 - y])
-            ax.errorbar(g[x], y, yerr=err, marker="o", capsize=3, label=label)
-        else:
-            ax.plot(g[x], y, marker="o", label=label)
-    ax.axhline(clean_wer * 100, color="gray", ls="--", lw=1, label=f"clean ({clean_wer:.1%})")
-    if reverse_x:
-        ax.invert_xaxis()                    # High SNR (easy) on the left, as in most papers
-    ax.set(xlabel=xlabel, ylabel="WER (%)", title=title)
-    ax.grid(alpha=0.3)
-    ax.legend()
+    """WER (with 95% bootstrap bars) and PER vs x, side by side; dashed lines = clean speech."""
+    metrics = [("wer", "WER (%)")] + ([("per", "PER (%)")] if df["per"].notna().all() else [])
+    fig, axes = plt.subplots(1, len(metrics), figsize=(6.5 * len(metrics), 4.5), squeeze=False)
+    for ax, (metric, ylabel) in zip(axes[0], metrics):
+        groups = df.groupby(group, sort=False) if group else [("clean speech", df)]
+        for label, g in groups:
+            g = g.sort_values(x)
+            y = g[metric] * 100
+            # Error bars from the bootstrap interval (computed for WER only)
+            if metric == "wer" and g.wer_lo.notna().all():
+                err = np.vstack([y - g.wer_lo * 100, g.wer_hi * 100 - y])
+                ax.errorbar(g[x], y, yerr=err, marker="o", capsize=3, label=label)
+            else:
+                ax.plot(g[x], y, marker="o", label=label)
+        ax.axhline(clean[metric] * 100, color="gray", ls="--", lw=1, label=f"clean ({clean[metric]:.1%})")
+        if reverse_x:
+            ax.invert_xaxis()                    # High SNR (easy) on the left, as in most papers
+        ax.set(xlabel=xlabel, ylabel=ylabel, title=f"{metric.upper()} — {title}")
+        ax.grid(alpha=0.3)
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+
+
+def plot_error_types(df: pd.DataFrame, x: str, group: str | None, xlabel: str, title: str,
+                     out: Path, reverse_x: bool = False) -> None:
+    """Stacked bars of substitutions, deletions and insertions (their sum = WER), one panel per noise.
+
+    Shows HOW a model fails: wrong words (S), missing words (D: typical of a model that falls silent
+    in heavy noise) or made-up words (I: typical of a model that hears speech in the noise).
+    """
+    groups = list(df.groupby(group, sort=False)) if group else [("clean speech", df)]
+    fig, axes = plt.subplots(1, len(groups), figsize=(5.5 * len(groups), 4.2), squeeze=False, sharey=True)
+    for ax, (label, g) in zip(axes[0], groups):
+        g = g.sort_values(x, ascending=not reverse_x)
+        pos = np.arange(len(g))
+        bottom = np.zeros(len(g))
+        for col, name in (("sub_rate", "substitutions"), ("del_rate", "deletions"), ("ins_rate", "insertions")):
+            vals = g[col].to_numpy() * 100
+            ax.bar(pos, vals, bottom=bottom, label=name)
+            bottom += vals
+        ax.set_xticks(pos, [f"{v:g}" for v in g[x]])
+        ax.set(xlabel=xlabel, title=str(label))
+        ax.grid(alpha=0.3, axis="y")
+    axes[0][0].set_ylabel("% of reference words (sum = WER)")
+    axes[0][-1].legend(loc="upper left", bbox_to_anchor=(1.02, 1))     # Outside the bars
+    fig.suptitle(title)
     fig.tight_layout()
     fig.savefig(out, dpi=150)
     plt.close(fig)
@@ -394,6 +458,7 @@ def main():
 
     try:
         print(f"Benchmarking {pt_path}\n  workspace {root}\n  device    {device}\n  output    {out}")
+        print(f"  PER       {'on (g2p_en)' if _g2p() is not None else 'off: pip install --no-deps g2p_en nltk inflect'}")
 
         # CARFAC builds one test-set cache per condition the first time: say what's coming
         if asr.frontend.expensive:
@@ -410,20 +475,26 @@ def main():
 
         # 3. Clean speech
         clean = clean_scores(asr)
-        clean_wer = float(clean.loc[clean.split == asr.cfg.data.test_split, "wer"].iloc[0])
+        clean_row = clean.loc[clean.split == asr.cfg.data.test_split].iloc[0]
+        clean_wer = float(clean_row.wer)
 
         # 4. Noise
         noise = noise_sweep(asr)
         summarize_noise(noise, clean_wer)
         if not noise.empty:
-            plot_sweep(noise, "snr_db", "noise", clean_wer, "SNR (dB)",
-                       f"WER vs SNR — {asr.frontend.name}", out / "wer_vs_snr.png", reverse_x=True)
+            plot_sweep(noise, "snr_db", "noise", clean_row, "SNR (dB)",
+                       asr.frontend.name, out / "wer_vs_snr.png", reverse_x=True)
+            plot_error_types(noise, "snr_db", "noise", "SNR (dB)",
+                             f"Word error types vs SNR — {asr.frontend.name}", out / "error_types_vs_snr.png",
+                             reverse_x=True)
 
         # 5. Level
         levels = level_sweep(asr)
         summarize_levels(levels, clean_wer)
-        plot_sweep(levels, "speech_db_spl", None, clean_wer, "speech level (dB SPL)",
-                   f"WER vs speech level — {asr.frontend.name}", out / "wer_vs_level.png")
+        plot_sweep(levels, "speech_db_spl", None, clean_row, "speech level (dB SPL)",
+                   asr.frontend.name, out / "wer_vs_level.png")
+        plot_error_types(levels, "speech_db_spl", None, "speech level (dB SPL)",
+                         f"Word error types vs level — {asr.frontend.name}", out / "error_types_vs_level.png")
 
         # 6. Save the tables: benchmark.csv concatenates across models with pd.concat
         pd.concat([noise, levels], ignore_index=True).to_csv(out / "benchmark.csv", index=False)

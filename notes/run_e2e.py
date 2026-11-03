@@ -164,8 +164,10 @@ def stage_registry():
     check({"logmel", "mfcc", "carfac"} <= set(registered["frontend"]), "a front end is missing from the registry")
     check("transformer_ctc" in registered["model"], "transformer_ctc is missing from the registry")
 
+    # The counts were computed by hand for this architecture: pin it, so changing the defaults doesn't break the check
+    fixed = dict(d_model=256, n_heads=4, n_layers=6, d_ff=1024, dropout=0.1, subsample_channels=128, subsample_factor=4)
     for n_feats, expected in ((65, 5_453_215), (80, 5_551_519)):
-        got = sum(p.numel() for p in TransformerCTC(n_feats=n_feats, vocab_size=31).parameters())
+        got = sum(p.numel() for p in TransformerCTC(n_feats=n_feats, vocab_size=31, **fixed).parameters())
         print(f"  params      n_feats={n_feats}: {got:,} (expected {expected:,})")
         check(got == expected, f"parameter count for n_feats={n_feats} is {got:,}, expected {expected:,}")
 

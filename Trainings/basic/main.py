@@ -63,7 +63,7 @@ car_params = {
     "first_pole_theta": 0.95 * math.pi,      # Highest pole freq in fs units (0.85π → 6.8 kHz, 0.95π → 7.6 kHz)
     "zero_ratio": math.sqrt(2),              # How far zero is above pole
     "high_f_damping_compression": 0.5,       # 0 to 1 to compress zeta
-    "erb_per_step": 0.42,                   # G&M's ERB formula (at 0.85π: 0.5 → 65, 0.405 → 80)
+    "erb_per_step": 0.42,                    # G&M's ERB formula 
     "min_pole_hz": 30,
     "erb_break_freq": 165.3,                 # Greenwood map's break freq
     "erb_q": 1000 / (24.7 * 4.37),           # Glasberg and Moore's high-cf ratio
@@ -78,7 +78,7 @@ carfac_fe = CarfacConfig(
     pooling="hann25",
 )
 
-FRONTEND = carfac_fe
+FRONTEND = logmel_fe
 
 # ---- Data: LibriSpeech "clean", from <root>/datasets/ 
 N_TRAIN_SHARDS = None                         # 4 ≈ 28 h (regression check); None = all 14 ≈ 100 h
@@ -100,18 +100,18 @@ MODEL = ModelConfig(
     n_heads=6,
     n_layers=6,
     d_ff=1536,
-    dropout=0.05,
+    dropout=0.1,
     subsample_channels=128,
     subsample_factor=4,
 )
 
 # ---- Training recipe 
 TRAIN = TrainConfig(
-    epochs=60,
+    epochs=75,
     peak_lr=1e-3,
     warmup_steps=1000,
     weight_decay=0.01,
-    max_frames_per_batch=40_000,          
+    max_frames_per_batch=35_000,          # smaller means more updates per epoch 
     grad_clip=1.0,
     amp="auto",                            # automatic mix precision choice. 
     specaugment={"freq_masks": 2, "freq_width": 15, "time_masks": 2, "time_width": 40,
@@ -119,11 +119,12 @@ TRAIN = TrainConfig(
     train_conditions=(CLEAN,),             # clean speech at 65 dB SPL, no noise
     n_noisy_variants=0,
     early_stop_patience=None,              # run all epochs, like the notebook
-    num_workers=1,                         # match --cpus-per-task in the Slurm job (leave 2 spare)
+    num_workers=6,                         # match --cpus-per-task in the Slurm job (leave 2 spare)
 )
 
-SEED = 25                                  # the notebook's seed
-NORM = "global"                            # 
+# Pick seed and normalization
+SEED = 30                                  
+NORM = "global"                             
 
 
 # =============================================================================
