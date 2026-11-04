@@ -78,7 +78,7 @@ carfac_fe = CarfacConfig(
     pooling="hann25",
 )
 
-FRONTEND = logmel_fe
+FRONTEND = carfac_fe
 
 # ---- Data: LibriSpeech "clean", from <root>/datasets/ 
 N_TRAIN_SHARDS = None                         # 4 ≈ 28 h (regression check); None = all 14 ≈ 100 h

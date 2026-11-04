@@ -7,6 +7,10 @@ Quantify errors in both words and chars units.
     PER                phoneme error rate: did the model hear the right SOUNDS? A misspelling such as
                        "medisene" for "medicine" is a whole wrong word for WER but only 2 of 7 phonemes
                        for PER. Text → phonemes with g2p_en (CMUdict, plus a neural guess for words not in it)
+    WPFER              weighted phone feature error rate: PER with partial credit for near-misses.
+                       A substitution costs how far apart the two phones are in articulatory features
+                       (panphon's 22 weighted features): /b/ → /p/ (voicing only) is cheap, /b/ → /s/ is
+                       expensive. Deletions and insertions cost 1, as in PER, so WPFER ≤ PER always.
     bootstrap_ci       how much that number could move with a different test set of the same kind
     paired_bootstrap   whether front end A really beats front end B on the same utterances
 
@@ -97,8 +101,8 @@ _G2P_FAILED = False
 def _g2p():
     """The g2p_en converter, created once. None (with one warning) if g2p_en can't be used here.
 
-    Install: pip install --no-deps g2p_en nltk inflect
-    (--no-deps: g2p_en lists the old `distance` package, which fails to build and isn't used at runtime)
+    Install: pip install --no-deps g2p_en && pip install nltk inflect
+    (--no-deps for g2p_en only: it lists the old `distance` package, which fails to build and isn't used)
     """
     global _G2P, _G2P_FAILED
     if _G2P is None and not _G2P_FAILED:
@@ -114,7 +118,7 @@ def _g2p():
         except Exception as e:                                                # noqa: BLE001
             _G2P_FAILED = True
             warnings.warn(f"PER disabled: g2p_en isn't usable here ({type(e).__name__}: {e}). "
-                          "Install with: pip install --no-deps g2p_en nltk inflect")
+                          "Install with: pip install --no-deps g2p_en && pip install nltk inflect")
     return _G2P
 
 
@@ -141,6 +145,86 @@ def phonemes(text: str) -> list[str] | None:
 
 
 # ==============================
+# Phone features (for WPFER)
+# ==============================
+
+# g2p_en's 39 ARPAbet phonemes (stress removed) → IPA, as panphon reads it. AH is mapped to schwa,
+# its most common value (unstressed); ER to the r-coloured vowel ɜ˞. Affricates and diphthongs are
+# two IPA segments: their feature vectors are averaged, so each phone stays one unit, aligned with PER.
+ARPABET_TO_IPA = {
+    "AA": "ɑ", "AE": "æ", "AH": "ə", "AO": "ɔ", "AW": "aʊ", "AY": "aɪ", "B": "b", "CH": "tʃ",
+    "D": "d", "DH": "ð", "EH": "ɛ", "ER": "ɜ˞", "EY": "eɪ", "F": "f", "G": "ɡ", "HH": "h",
+    "IH": "ɪ", "IY": "i", "JH": "dʒ", "K": "k", "L": "l", "M": "m", "N": "n", "NG": "ŋ",
+    "OW": "oʊ", "OY": "ɔɪ", "P": "p", "R": "ɹ", "S": "s", "SH": "ʃ", "T": "t", "TH": "θ",
+    "UH": "ʊ", "UW": "u", "V": "v", "W": "w", "Y": "j", "Z": "z", "ZH": "ʒ",
+}
+
+_PHONE_TABLE = None
+_PHONE_TABLE_FAILED = False
+
+
+def _phone_table():
+    """(phone → row index, substitution-cost matrix) built once from panphon; None if panphon isn't usable.
+
+    Substitution cost between phones a and b = Σ_f w_f·|a_f − b_f| / (2·Σ_f w_f), over panphon's 22
+    weighted features (values −1/0/+1, so the largest possible difference is 2·Σw). It lies in [0, 1]:
+    0 for the same sound, 1 for phones opposite in every feature.
+
+    Install: pip install --no-deps panphon && pip install editdistance munkres pyyaml unicodecsv
+    (--no-deps for panphon only: it lists `setuptools`, whose pin can clash with other packages)
+    """
+    global _PHONE_TABLE, _PHONE_TABLE_FAILED
+    if _PHONE_TABLE is None and not _PHONE_TABLE_FAILED:
+        try:
+            import panphon
+            ft = panphon.FeatureTable()
+            weights = np.asarray(ft.weights, dtype=np.float64)              # (22,): pairs with the first 22 features
+            phones = sorted(ARPABET_TO_IPA)
+            vecs = []
+            for ph in phones:
+                segs = ft.word_to_vector_list(ARPABET_TO_IPA[ph], numeric=True)
+                if not segs:
+                    raise ValueError(f"panphon doesn't know {ARPABET_TO_IPA[ph]!r} (ARPAbet {ph})")
+                vecs.append(np.mean(np.asarray(segs, dtype=np.float64), axis=0)[: len(weights)])
+            vecs = np.stack(vecs)                                            # (39, 22)
+            diff = np.abs(vecs[:, None, :] - vecs[None, :, :]) @ weights      # (39, 39)
+            _PHONE_TABLE = ({ph: i for i, ph in enumerate(phones)}, diff / (2 * weights.sum()))
+        except Exception as e:                                                # noqa: BLE001
+            _PHONE_TABLE_FAILED = True
+            warnings.warn(f"WPFER disabled: panphon isn't usable here ({type(e).__name__}: {e}). Install with: "
+                          "pip install --no-deps panphon && pip install editdistance munkres pyyaml unicodecsv")
+    return _PHONE_TABLE
+
+
+def weighted_phone_distance(ref: Sequence[str], hyp: Sequence[str]) -> float | None:
+    """Edit distance between two phoneme sequences where a substitution costs the phones' feature
+    distance (0–1, see _phone_table) and a deletion or insertion costs 1. None without panphon.
+
+    Same dynamic programming as edit_distance, one row at a time with NumPy. Within a row the
+    insertion term chains left to right (cur[j] depends on cur[j-1]); that chain is a running
+    minimum: cur[j] = min_k≤j (base[k] − k) + j, computed with np.minimum.accumulate.
+    """
+    table = _phone_table()
+    if table is None:
+        return None
+    index, cost = table
+    r = np.array([index[p] for p in ref], dtype=np.int64)
+    h = np.array([index[p] for p in hyp], dtype=np.int64)
+    if len(r) == 0 or len(h) == 0:
+        return float(len(r) + len(h))                                      # Only deletions or insertions
+
+    cols = np.arange(len(h) + 1, dtype=np.float64)
+    prev = cols.copy()                                                      # Row 0: j insertions
+    for i, ri in enumerate(r, start=1):
+        base = np.empty(len(h) + 1)
+        base[0] = i                                                         # Column 0: i deletions
+        base[1:] = np.minimum(prev[1:] + 1.0,                               # Deletion of ref[i-1]
+                              prev[:-1] + cost[ri, h])                      # Substitution (0 on a match)
+        prev = np.minimum.accumulate(base - cols) + cols                    # Insertions, chained along the row
+    return float(prev[-1])
+
+
+# ==============================
 # Scores
 # ==============================
 
@@ -151,12 +235,15 @@ def _error_counts(ref: str, hyp: str, with_phonemes: bool = True) -> dict:
     out = {"w_err": s_ + d + n, "w_ref": len(ref_w), "w_sub": s_, "w_del": d, "w_ins": n,
            "c_err": edit_distance(ref, hyp), "c_ref": len(ref)}
 
-    # PER: NaN when g2p_en isn't available, so scoring never fails because of it
+    # PER and WPFER: NaN when g2p_en / panphon aren't available, so scoring never fails because of them
     ref_p = phonemes(ref) if with_phonemes else None
     if ref_p is None:
-        out["p_err"], out["p_ref"] = np.nan, np.nan
+        out["p_err"], out["p_ref"], out["pf_err"] = np.nan, np.nan, np.nan
     else:
-        out["p_err"], out["p_ref"] = edit_distance(ref_p, phonemes(hyp)), len(ref_p)
+        hyp_p = phonemes(hyp)
+        out["p_err"], out["p_ref"] = edit_distance(ref_p, hyp_p), len(ref_p)
+        wd = weighted_phone_distance(ref_p, hyp_p)
+        out["pf_err"] = np.nan if wd is None else wd
     return out
 
 
@@ -164,7 +251,8 @@ def utterance_errors(utt_ids: Sequence[str], refs: Sequence[str], hyps: Sequence
                      with_phonemes: bool = True) -> pd.DataFrame:
     """One row per utterance: error counts and reference lengths, in words, characters and phonemes.
 
-    Columns: utt_id, ref, hyp, w_err, w_ref, w_sub, w_del, w_ins, c_err, c_ref, p_err, p_ref.
+    Columns: utt_id, ref, hyp, w_err, w_ref, w_sub, w_del, w_ins, c_err, c_ref, p_err, p_ref, pf_err
+    (pf_err: the feature-weighted phone distance, a float; WPFER = Σ pf_err / Σ p_ref).
     Keeping counts (not per-utterance rates) is what makes corpus rates and the bootstrap exact.
     """
     rows = [{"utt_id": utt_id, "ref": ref, "hyp": hyp, **_error_counts(ref, hyp, with_phonemes)}
@@ -175,8 +263,8 @@ def utterance_errors(utt_ids: Sequence[str], refs: Sequence[str], hyps: Sequence
 def add_error_columns(per_utt: pd.DataFrame) -> pd.DataFrame:
     """Fill in S/D/I and phoneme columns missing from an older per-utterance table (e.g. a CSV
     written before PER existed), recomputing them from its ref and hyp text. No model needed."""
-    needed = {"w_sub", "w_del", "w_ins", "p_err", "p_ref"}
-    if needed.issubset(per_utt.columns) and per_utt.p_err.notna().all():
+    needed = {"w_sub", "w_del", "w_ins", "p_err", "p_ref", "pf_err"}
+    if needed.issubset(per_utt.columns) and per_utt.p_err.notna().all() and per_utt.pf_err.notna().all():
         return per_utt
     df = per_utt.copy()
     df["ref"], df["hyp"] = df.ref.fillna("").astype(str), df.hyp.fillna("").astype(str)
@@ -207,6 +295,7 @@ class EvalResult:
     per_utt: Any = None    # pandas DataFrame: see utterance_errors() for the columns
     wer_ci: tuple[float, float] | None = None
     per: float = float("nan")         # Phoneme error rate (NaN without g2p_en)
+    wpfer: float = float("nan")       # Weighted phone feature error rate (NaN without g2p_en or panphon)
     sub_rate: float = float("nan")    # Substitutions / reference words
     del_rate: float = float("nan")    # Deletions / reference words
     ins_rate: float = float("nan")    # Insertions / reference words (sub + del + ins = WER)
@@ -236,6 +325,8 @@ class EvalResult:
             result.ins_rate = float(per_utt.w_ins.sum() / n_words)
         if "p_err" in per_utt.columns and per_utt.p_err.notna().all():
             result.per = float(per_utt.p_err.sum() / per_utt.p_ref.sum())
+        if "pf_err" in per_utt.columns and per_utt.pf_err.notna().all():
+            result.wpfer = float(per_utt.pf_err.sum() / per_utt.p_ref.sum())
         if ci:
             result.wer_ci = bootstrap_ci(result)
         return result

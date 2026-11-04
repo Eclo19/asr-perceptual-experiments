@@ -16,9 +16,11 @@ Every evaluation is also recorded in models/<name>_meta.json and results/<name>/
 
 Metrics for every condition: WER (with a 95% bootstrap interval), CER, PER (phoneme error rate:
 did the model hear the right sounds, even when it misspelled the word?) and the word errors split
-into substitutions / deletions / insertions (S/D/I, which add up to WER). PER needs g2p_en:
-    pip install --no-deps g2p_en nltk inflect
-Without it, everything else still runs and PER shows as "—".
+into substitutions / deletions / insertions (S/D/I, which add up to WER), and WPFER (PER with partial
+credit for acoustically close phones, from panphon's articulatory features; always ≤ PER).
+PER needs g2p_en and WPFER also needs panphon:
+    pip install --no-deps g2p_en panphon && pip install nltk inflect editdistance munkres pyyaml unicodecsv
+Without them, everything else still runs and those columns show as "—".
 
 Cost: log-mel and MFCC are computed on the fly, so each condition takes about a minute on a GPU.
 CARFAC needs a feature cache for EVERY condition (one full pass over test-clean, about 5.4 h of
@@ -44,7 +46,7 @@ import pandas as pd
 import torch
 
 from asrlib import ASR, CLEAN, Condition, NoiseBank
-from asrlib.metrics import _g2p
+from asrlib.metrics import _g2p, _phone_table
 
 # Print immediately, line by line, even into a Slurm log
 sys.stdout.reconfigure(line_buffering=True)
@@ -55,7 +57,7 @@ sys.stdout.reconfigure(line_buffering=True)
 # =============================================================================
 
 # The model: a .pt file, a _meta.json file, or a model name (looked up in <ROOT>/models/)
-MODEL = "models/2026-11-03_carfac-agc-log_librispeech-train.100_clean_s30_64fdc8_meta.json"
+MODEL = "models/2026-11-04_logmel80_librispeech-train.100_clean_s30_44568e_meta.json"
 
 # Workspace root. None: the folder that holds models/ (inferred from MODEL), else the current folder
 ROOT = None
@@ -278,6 +280,7 @@ def clean_scores(asr: ASR) -> pd.DataFrame:
         r = asr.evaluate(split=split, condition=asr.clean, max_utts=MAX_UTTS)
         lo, hi = r.wer_ci
         print(f"\n  {split}: WER {r.wer:.2%}  (95% CI {lo:.2%}–{hi:.2%})  CER {r.cer:.2%}  PER {pct(r.per)}  "
+              f"WPFER {pct(r.wpfer)}  "
               f"loss {r.loss:.3f}  over {r.n_utts} utterances")
         print(f"    word errors            substitutions {r.sub_rate:.2%}, deletions {r.del_rate:.2%}, "
               f"insertions {r.ins_rate:.2%}  (sum = WER)")
@@ -355,7 +358,7 @@ def summarize_noise(noise: pd.DataFrame, clean_wer: float) -> None:
         print(f"\n  {kind}")
         for _, r in group.sort_values("snr_db", ascending=False).iterrows():
             print(f"    {r.snr_db:5g} dB   {fmt_ci(r)}   ×{r.wer / clean_wer:4.1f} clean   "
-                  f"PER {pct(r.per):>6s}   {fmt_types(r)}")
+                  f"PER {pct(r.per):>6s}   WPFER {pct(r.wpfer):>6s}   {fmt_types(r)}")
 
         # Two robustness numbers: where the error rate doubles, and how far down it stays usable
         g = group.sort_values("snr_db", ascending=False)
@@ -365,7 +368,7 @@ def summarize_noise(noise: pd.DataFrame, clean_wer: float) -> None:
               f"WER < 50% down to {format(usable.min(), 'g') + ' dB' if len(usable) else 'no SNR tested'}")
 
     # Compact tables: rows = noise, columns = SNR
-    for metric in ("wer", "per"):
+    for metric in ("wer", "per", "wpfer"):
         if noise[metric].isna().all():
             continue
         table = noise.pivot_table(index="noise", columns="snr_db", values=metric, sort=False) * 100
@@ -378,13 +381,13 @@ def summarize_levels(levels: pd.DataFrame, clean_wer: float) -> None:
     header("LEVEL SUMMARY: WER [95% CI] by speech level")
     for _, r in levels.sort_values("speech_db_spl").iterrows():
         print(f"    {r.speech_db_spl:5g} dB SPL   {fmt_ci(r)}   ×{r.wer / clean_wer:4.1f} clean   "
-              f"PER {pct(r.per):>6s}   {fmt_types(r)}")
+              f"PER {pct(r.per):>6s}   WPFER {pct(r.wpfer):>6s}   {fmt_types(r)}")
 
 
 def plot_sweep(df: pd.DataFrame, x: str, group: str | None, clean: pd.Series,
                xlabel: str, title: str, out: Path, reverse_x: bool = False) -> None:
-    """WER (with 95% bootstrap bars) and PER vs x, side by side; dashed lines = clean speech."""
-    metrics = [("wer", "WER (%)")] + ([("per", "PER (%)")] if df["per"].notna().all() else [])
+    """WER (with 95% bootstrap bars), PER and WPFER vs x, side by side; dashed lines = clean speech."""
+    metrics = [("wer", "WER (%)")] + [(m, f"{m.upper()} (%)") for m in ("per", "wpfer") if df[m].notna().all()]
     fig, axes = plt.subplots(1, len(metrics), figsize=(6.5 * len(metrics), 4.5), squeeze=False)
     for ax, (metric, ylabel) in zip(axes[0], metrics):
         groups = df.groupby(group, sort=False) if group else [("clean speech", df)]
@@ -458,7 +461,8 @@ def main():
 
     try:
         print(f"Benchmarking {pt_path}\n  workspace {root}\n  device    {device}\n  output    {out}")
-        print(f"  PER       {'on (g2p_en)' if _g2p() is not None else 'off: pip install --no-deps g2p_en nltk inflect'}")
+        print(f"  PER       {'on (g2p_en)' if _g2p() is not None else 'off: g2p_en missing (see the docstring)'}")
+        print(f"  WPFER     {'on (panphon)' if _phone_table() is not None else 'off: panphon missing (see the docstring)'}")
 
         # CARFAC builds one test-set cache per condition the first time: say what's coming
         if asr.frontend.expensive:

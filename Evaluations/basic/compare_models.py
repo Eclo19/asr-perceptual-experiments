@@ -9,6 +9,7 @@ For every condition that all models were scored on, it reports:
 
     WER of A and B, ΔWER = WER_A - WER_B with a 95% interval, and a two-sided p-value
     PER of A and B and ΔPER, tested the same way (did the model hear the right sounds?)
+    WPFER of A and B and ΔWPFER: PER with partial credit for acoustically close phones (panphon)
     the word errors of each side split into substitutions / deletions / insertions
 
 using the paired bootstrap (Bisani & Ney, 2004): resample the test UTTERANCES 1,000 times, score
@@ -20,13 +21,13 @@ the test-set sampling; the per-seed signs show whether training randomness could
 A claim needs both: every seed agrees on the sign, and the pooled p-value (Holm-corrected for the
 number of conditions) is below 0.05. WER is the primary metric; PER is reported alongside.
 
-Results saved before PER existed are upgraded on the fly: S/D/I and PER are recomputed from their
-ref/hyp text (needs g2p_en: pip install --no-deps g2p_en nltk inflect). Nothing is rewritten on disk.
+Results saved before these metrics existed are upgraded on the fly: S/D/I, PER and WPFER are recomputed from their
+ref/hyp text (needs g2p_en and panphon, see benchmark_model.py). Nothing is rewritten on disk.
 
 Outputs go to results/compare/<A>_vs_<B>_<split>/:
     comparison.csv                       every number in the tables below
-    wer_vs_snr.png, per_vs_snr.png       A and B on the same axes, one panel per noise
-    wer_vs_level.png, per_vs_level.png   A and B on the same axes
+    {wer,per,wpfer}_vs_snr.png           A and B on the same axes, one panel per noise
+    {wer,per,wpfer}_vs_level.png         A and B on the same axes
     delta_vs_snr.png, delta_vs_level.png ΔWER with its 95% interval (below 0 = A better)
     report.txt                           a copy of everything printed
 
@@ -48,7 +49,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from asrlib.metrics import _g2p, add_error_columns
+from asrlib.metrics import _g2p, _phone_table, add_error_columns
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -62,7 +63,7 @@ MODELS_A = [
     "models/2026-11-03_carfac-agc-log_librispeech-train.100_clean_s30_64fdc8_meta.json",
 ]
 MODELS_B = [
-    "models/2026-11-03_logmel80_librispeech-train.100_clean_s30_fc49ec",
+    "models/2026-11-03_logmel80_librispeech-train.100_clean_s30_fc49ec_meta.json",
 ]
 
 # Workspace root. None: the folder that holds models/ (inferred from the first model), else the current folder
@@ -73,7 +74,12 @@ SPLIT = "test"
 
 # Conditions to compare (names as saved, e.g. "clean", "white@10dB", "clean@45dBSPL").
 # None: every condition that ALL models were scored on
-CONDITIONS = None
+# Conditions to compare (names as saved by benchmark_model.py's default sweep)
+CONDITIONS = (
+    ["clean"]
+    + [f"white@{snr:g}dB" for snr in (40, 30, 20, 10, 5, 0, -5, -10)]          # White noise, speech at 65 dB SPL
+    + [f"clean@{level:g}dBSPL" for level in (35, 45, 55, 75, 85, 95)]          # Level sweep (65 dB SPL = "clean")
+)
 
 # Bootstrap draws, and the seed of the resampling (fixed: same answer every run)
 N_BOOT = 1000
@@ -167,7 +173,7 @@ def paired_stats(pairs: list[tuple[pd.DataFrame, pd.DataFrame]], n_boot: int, se
                  err: str = "w_err", ref: str = "w_ref") -> dict:
     """Error rate of A and B and their difference A - B, with a paired bootstrap over utterances.
 
-    err/ref pick the unit: ("w_err", "w_ref") = WER, ("p_err", "p_ref") = PER.
+    err/ref pick the unit: ("w_err", "w_ref") = WER, ("p_err", "p_ref") = PER, ("pf_err", "p_ref") = WPFER.
     Each draw resamples the utterances ONCE and scores every seed of both systems on them, so the
     comparison stays paired (same utterances for A and B) and the seeds are averaged, not pooled
     as if they were extra utterances. With one pair, WER is exactly asrlib's paired_bootstrap.
@@ -322,7 +328,8 @@ def main():
             print(f"  WARNING: {message}")
         else:
             print(f"  controlled hash {hashes.pop()}: comparable")
-        print(f"  PER: {'on (g2p_en)' if _g2p() is not None else 'off: pip install --no-deps g2p_en nltk inflect'}")
+        print(f"  PER: {'on (g2p_en)' if _g2p() is not None else 'off (g2p_en missing)'}   "
+              f"WPFER: {'on (panphon)' if _phone_table() is not None else 'off (panphon missing)'}")
 
         # Conditions every model has results for
         names = [n for n, _ in a_models + b_models]
@@ -345,6 +352,9 @@ def main():
             if has_per:
                 row.update({f"per_{k}": v for k, v in
                             paired_stats(pairs, N_BOOT, BOOT_SEED, err="p_err", ref="p_ref").items()})
+            if all(f.pf_err.notna().all() for pair in pairs for f in pair):
+                row.update({f"wpfer_{k}": v for k, v in
+                            paired_stats(pairs, N_BOOT, BOOT_SEED, err="pf_err", ref="p_ref").items()})
             row.update({f"{k}_a": v for k, v in error_types([a for a, _ in pairs]).items()})
             row.update({f"{k}_b": v for k, v in error_types([b for _, b in pairs]).items()})
             rows.append(row)
@@ -352,8 +362,11 @@ def main():
         df = pd.DataFrame(rows)
         has_per = "per_a" in df and df.per_a.notna().all()
         df["wer_p_holm"] = holm(df.wer_p.tolist())
+        has_wpfer = "wpfer_a" in df and df.wpfer_a.notna().all()
         if has_per:
             df["per_p_holm"] = holm(df.per_p.tolist())
+        if has_wpfer:
+            df["wpfer_p_holm"] = holm(df.wpfer_p.tolist())
         df["verdict"] = np.where(
             (df.wer_p_holm < 0.05) & df.wer_seeds_agree,
             np.where(df.wer_delta < 0, f"{label_a} better", f"{label_b} better"),
@@ -365,7 +378,7 @@ def main():
                             ascending=[True, True, False, True], na_position="first").drop(columns="_kind")
 
         if _UPGRADED:
-            print(f"  Recomputed S/D/I and PER from saved text for {len(_UPGRADED)} older result table(s) "
+            print(f"  Recomputed S/D/I, PER and WPFER from saved text for {len(_UPGRADED)} older result table(s) "
                   "(re-run benchmark_model.py to store them)")
 
         # ---- Table 1: WER, the primary metric
@@ -378,16 +391,25 @@ def main():
                   f"[{r.wer_delta_lo * 100:+6.2f}, {r.wer_delta_hi * 100:+6.2f}] {r.wer_p:6.3f} "
                   f"{r.wer_p_holm:7.3f} {agree:>6s}  {r.verdict}")
 
-        # ---- Table 2: PER and how the word errors split
-        print(f"\nPER and word error types (S/D/I, % of reference words; they add up to WER)")
+        # ---- Table 2: phoneme-level metrics
+        def phone_cols(r, m, ok):
+            if not ok:
+                return f"{'—':>7s} {'—':>7s} {'—':>7s} {'—':>7s}"
+            return f"{r[f'{m}_a']:7.2%} {r[f'{m}_b']:7.2%} {r[f'{m}_delta'] * 100:+6.2f}  {r[f'{m}_p_holm']:7.3f}"
+
+        print("\nPhoneme metrics: PER, and WPFER (PER with partial credit for close phones)")
         print(f"{'condition':22s} {'PER A':>7s} {'PER B':>7s} {'ΔPER':>7s} {'p_holm':>7s}   "
-              f"{'A: S / D / I':>18s}   {'B: S / D / I':>18s}")
+              f"{'WPFER A':>7s} {'WPFER B':>7s} {'ΔWPFER':>7s} {'p_holm':>7s}")
         for _, r in df.iterrows():
-            per_txt = (f"{r.per_a:7.2%} {r.per_b:7.2%} {r.per_delta * 100:+6.2f}  {r.per_p_holm:7.3f}"
-                       if has_per else f"{'—':>7s} {'—':>7s} {'—':>7s} {'—':>7s}")
+            print(f"{r.condition:22s} {phone_cols(r, 'per', has_per)}   {phone_cols(r, 'wpfer', has_wpfer)}")
+
+        # ---- Table 3: how the word errors split
+        print("\nWord error types (S / D / I, % of reference words; they add up to WER)")
+        print(f"{'condition':22s} {'A: S / D / I':>18s}   {'B: S / D / I':>18s}")
+        for _, r in df.iterrows():
             types = [f"{r[f'sub_{s}'] * 100:5.1f} /{r[f'del_{s}'] * 100:5.1f} /{r[f'ins_{s}'] * 100:5.1f}"
                      for s in ("a", "b")]
-            print(f"{r.condition:22s} {per_txt}   {types[0]:>18s}   {types[1]:>18s}")
+            print(f"{r.condition:22s} {types[0]:>18s}   {types[1]:>18s}")
 
         print("\nΔ in percentage points; negative = A better. A WER difference counts only when every "
               "seed agrees on its sign and p_holm < 0.05.")
@@ -404,7 +426,7 @@ def main():
         clean = df[df.condition == "clean"].iloc[0] if (df.condition == "clean").any() else None
         noisy = df[df.noise.notna() & (df.speech_db_spl == 65)]
         levels = df[df.noise.isna()]
-        for metric in ("wer", "per") if has_per else ("wer",):
+        for metric in ["wer"] + (["per"] if has_per else []) + (["wpfer"] if has_wpfer else []):
             if not noisy.empty:
                 plot_two_curves(noisy, metric, "snr_db", "noise", (label_a, label_b), clean, "SNR (dB)",
                                 out / f"{metric}_vs_snr.png", reverse_x=True)
