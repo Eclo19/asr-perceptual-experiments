@@ -5,6 +5,7 @@ noise/
 models/
 results/
 Backup_Models/
+logs/
 
 # Python
 __pycache__/

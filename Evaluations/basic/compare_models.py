@@ -62,11 +62,12 @@ sys.stdout.reconfigure(line_buffering=True)
 # =============================================================================
 
 # System A and system B: .pt files, _meta.json files or model names. One per seed, same seed order
+# If comparing carfac vs log mel, the convention has been to put carfac on A
 MODELS_A = [
-    "models/2026-11-03_carfac-agc-log_librispeech-train.100_clean_s25_af2b85.pt",
+    "Backup_Models/Transformer_CTC_Models_Good/2026-11-03_carfac-agc-log_librispeech-train.100_clean_s30_64fdc8_meta.json",
 ]
 MODELS_B = [
-    "models/2026-11-02_logmel80_librispeech-train.100_clean_s25_95b1a7_meta.json",
+    "Backup_Models/Transformer_CTC_Models_Good/2026-11-03_logmel80_librispeech-train.100_clean_s30_fc49ec_meta.json",
 ]
 
 # Workspace root. None: the folder that holds models/ (inferred from the first model), else the current folder

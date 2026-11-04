@@ -55,6 +55,7 @@ logmel_fe = LogMelConfig(
     n_mels=80
 )
 
+# For a quick check of the CARFAC model's behavior wrt these parameters, experiment on cell 
 car_params = {
     "velocity_scale": 0.1,                   # For the velocity nonlinearity
     "v_offset": 0.04,                        # Offset gives a quadratic part
@@ -81,7 +82,7 @@ carfac_fe = CarfacConfig(
 FRONTEND = carfac_fe
 
 # ---- Data: LibriSpeech "clean", from <root>/datasets/ 
-N_TRAIN_SHARDS = None                         # 4 ≈ 28 h (regression check); None = all 14 ≈ 100 h
+N_TRAIN_SHARDS = 3                         # 4 ≈ 28 h (regression check); None = all 14 ≈ 100 h
 
 DATA = DataConfig(
     corpus="librispeech",
@@ -189,11 +190,11 @@ def main():
 
     # Score on test-clean (clean speech at the training level), with a 95% bootstrap interval
     print("\nStarting evaluation...\n")
-    result = asr_basic.evaluate()
+    result = asr.evaluate(split="validation", condition=Condition("white", 10))
     lo, hi = result.wer_ci
     print(f"\nTEST {asr_basic.name}\n  WER {result.wer:.2%}  (95% CI {lo:.2%}–{hi:.2%})  CER {result.cer:.2%}  "
           f"over {result.n_utts} utterances")
 
-
+print("\n\nDEFAULT RUN:\n\n")
 if __name__ == "__main__":
     main()
