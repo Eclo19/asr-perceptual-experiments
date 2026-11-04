@@ -4,6 +4,7 @@ features/
 noise/
 models/
 results/
+Backup_Models/
 
 # Python
 __pycache__/

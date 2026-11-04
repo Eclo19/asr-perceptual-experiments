@@ -94,7 +94,7 @@ DATA = DataConfig(
 )
 
 # ---- Model: Transformer-CTC (≈ 5.55 M parameters with 80 mel bins)
-MODEL = ModelConfig(
+transformer_ctc_model_conv1d = ModelConfig(
     arch="transformer_ctc_conv1d", # "transformer_ctc", "transformer_ctc_conv1d"
     d_model=384,
     n_heads=6,
@@ -105,7 +105,19 @@ MODEL = ModelConfig(
     subsample_factor=4,
 )
 
+conformer_ctc_model = ModelConfig(
+    arch="conformer_ctc", 
+    d_model=256, n_heads=4, 
+    n_layers=12, 
+    d_ff=1024, 
+    dropout=0.1
+)
+
+MODEL = conformer_ctc_model
+
+
 # ---- Training recipe 
+"""
 TRAIN = TrainConfig(
     epochs=60,
     peak_lr=1e-3,
@@ -120,6 +132,23 @@ TRAIN = TrainConfig(
     n_noisy_variants=0,
     early_stop_patience=None,              # run all epochs, like the notebook
     num_workers=6,                         # match --cpus-per-task in the Slurm job (leave 2 spare)
+)
+"""
+
+TRAIN = TrainConfig(
+    epochs=100,                        # Conformers keep improving longer; ~2–3 h at this speed
+    peak_lr=5e-4,
+    warmup_steps=10_000,                 
+    weight_decay=0.01,
+    max_frames_per_batch=35_000,       # ~1,000 steps per epoch
+    grad_clip=1.0,
+    amp="auto",
+    specaugment={"freq_masks": 2, "freq_width": 27, "time_masks": 2, "time_width": 50,
+                 "scale_freq_to_n_feats": True},
+    train_conditions=(CLEAN,),
+    n_noisy_variants=0,
+    early_stop_patience=None,
+    num_workers=6,
 )
 
 # Pick seed and normalization

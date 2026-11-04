@@ -229,6 +229,6 @@ class Trainer:
         rng = state["rng"]
         random.setstate(rng["python"])
         np.random.set_state(rng["numpy"])
-        torch.set_rng_state(rng["torch"])
+        torch.set_rng_state(rng["torch"].to("cpu", torch.uint8))
         if rng["cuda"] is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(rng["cuda"])
+            torch.cuda.set_rng_state_all([s.to("cpu", torch.uint8) for s in rng["cuda"]])
