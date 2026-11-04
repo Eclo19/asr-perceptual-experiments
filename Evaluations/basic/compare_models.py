@@ -8,6 +8,7 @@ results/<name>/per_utt/<split>__<condition>.csv. Run benchmark_model.py on every
 For every condition that all models were scored on, it reports:
 
     WER of A and B, ΔWER = WER_A - WER_B with a 95% interval, and a two-sided p-value
+    CER of A and B and ΔCER, tested the same way (character errors: spelling-tolerant)
     PER of A and B and ΔPER, tested the same way (did the model hear the right sounds?)
     WPFER of A and B and ΔWPFER: PER with partial credit for acoustically close phones (panphon)
     the word errors of each side split into substitutions / deletions / insertions
@@ -24,10 +25,12 @@ number of conditions) is below 0.05. WER is the primary metric; PER is reported 
 Results saved before these metrics existed are upgraded on the fly: S/D/I, PER and WPFER are recomputed from their
 ref/hyp text (needs g2p_en and panphon, see benchmark_model.py). Nothing is rewritten on disk.
 
-Outputs go to results/compare/<A>_vs_<B>_<split>/:
+Outputs go to results/compare/<A>_vs_<B>_<split>_<controlled hash>_s<seeds>/
+(e.g. carfac-agc-log_vs_logmel80_test_5a5788_s30), so comparisons of different recipes or seed
+sets never overwrite each other:
     comparison.csv                       every number in the tables below
-    {wer,per,wpfer}_vs_snr.png           A and B on the same axes, one panel per noise
-    {wer,per,wpfer}_vs_level.png         A and B on the same axes
+    {wer,cer,per,wpfer}_vs_snr.png       A and B on the same axes, one panel per noise
+    {wer,cer,per,wpfer}_vs_level.png     A and B on the same axes
     delta_vs_snr.png, delta_vs_level.png ΔWER with its 95% interval (below 0 = A better)
     report.txt                           a copy of everything printed
 
@@ -60,10 +63,10 @@ sys.stdout.reconfigure(line_buffering=True)
 
 # System A and system B: .pt files, _meta.json files or model names. One per seed, same seed order
 MODELS_A = [
-    "models/2026-11-03_carfac-agc-log_librispeech-train.100_clean_s30_64fdc8_meta.json",
+    "models/2026-11-03_carfac-agc-log_librispeech-train.100_clean_s25_af2b85.pt",
 ]
 MODELS_B = [
-    "models/2026-11-03_logmel80_librispeech-train.100_clean_s30_fc49ec_meta.json",
+    "models/2026-11-02_logmel80_librispeech-train.100_clean_s25_95b1a7_meta.json",
 ]
 
 # Workspace root. None: the folder that holds models/ (inferred from the first model), else the current folder
@@ -74,12 +77,7 @@ SPLIT = "test"
 
 # Conditions to compare (names as saved, e.g. "clean", "white@10dB", "clean@45dBSPL").
 # None: every condition that ALL models were scored on
-# Conditions to compare (names as saved by benchmark_model.py's default sweep)
-CONDITIONS = (
-    ["clean"]
-    + [f"white@{snr:g}dB" for snr in (40, 30, 20, 10, 5, 0, -5, -10)]          # White noise, speech at 65 dB SPL
-    + [f"clean@{level:g}dBSPL" for level in (35, 45, 55, 75, 85, 95)]          # Level sweep (65 dB SPL = "clean")
-)
+CONDITIONS = None
 
 # Bootstrap draws, and the seed of the resampling (fixed: same answer every run)
 N_BOOT = 1000
@@ -173,7 +171,8 @@ def paired_stats(pairs: list[tuple[pd.DataFrame, pd.DataFrame]], n_boot: int, se
                  err: str = "w_err", ref: str = "w_ref") -> dict:
     """Error rate of A and B and their difference A - B, with a paired bootstrap over utterances.
 
-    err/ref pick the unit: ("w_err", "w_ref") = WER, ("p_err", "p_ref") = PER, ("pf_err", "p_ref") = WPFER.
+    err/ref pick the unit: ("w_err", "w_ref") = WER, ("c_err", "c_ref") = CER, ("p_err", "p_ref") = PER,
+    ("pf_err", "p_ref") = WPFER.
     Each draw resamples the utterances ONCE and scores every seed of both systems on them, so the
     comparison stays paired (same utterances for A and B) and the seeds are averaged, not pooled
     as if they were extra utterances. With one pair, WER is exactly asrlib's paired_bootstrap.
@@ -306,7 +305,13 @@ def main():
 
     label_a = a_models[0][1]["frontend"]["name"]
     label_b = b_models[0][1]["frontend"]["name"]
-    out = root / "results" / "compare" / f"{label_a}_vs_{label_b}_{SPLIT}"
+
+    # One folder per (front ends, split, recipe, seeds): the controlled hash identifies the recipe
+    # (model, data, training), so e.g. Transformer and Conformer comparisons get separate folders
+    all_hashes = sorted({m["controlled_hash"] for _, m in a_models + b_models})
+    recipe = all_hashes[0] if len(all_hashes) == 1 else "mixed-" + "-".join(all_hashes)
+    seeds = "-".join(str(m["seed"]) for _, m in a_models)
+    out = root / "results" / "compare" / f"{label_a}_vs_{label_b}_{SPLIT}_{recipe}_s{seeds}"
     out.mkdir(parents=True, exist_ok=True)
     tee = Tee(sys.stdout)
     sys.stdout = tee
@@ -348,6 +353,8 @@ def main():
                      for (na, _), (nb, _) in zip(a_models, b_models)]
             row = {"condition": cond, **parse_condition(cond)}
             row.update({f"wer_{k}": v for k, v in paired_stats(pairs, N_BOOT, BOOT_SEED).items()})
+            row.update({f"cer_{k}": v for k, v in
+                        paired_stats(pairs, N_BOOT, BOOT_SEED, err="c_err", ref="c_ref").items()})
             has_per = all(f.p_err.notna().all() for pair in pairs for f in pair)
             if has_per:
                 row.update({f"per_{k}": v for k, v in
@@ -362,6 +369,7 @@ def main():
         df = pd.DataFrame(rows)
         has_per = "per_a" in df and df.per_a.notna().all()
         df["wer_p_holm"] = holm(df.wer_p.tolist())
+        df["cer_p_holm"] = holm(df.cer_p.tolist())
         has_wpfer = "wpfer_a" in df and df.wpfer_a.notna().all()
         if has_per:
             df["per_p_holm"] = holm(df.per_p.tolist())
@@ -397,11 +405,13 @@ def main():
                 return f"{'—':>7s} {'—':>7s} {'—':>7s} {'—':>7s}"
             return f"{r[f'{m}_a']:7.2%} {r[f'{m}_b']:7.2%} {r[f'{m}_delta'] * 100:+6.2f}  {r[f'{m}_p_holm']:7.3f}"
 
-        print("\nPhoneme metrics: PER, and WPFER (PER with partial credit for close phones)")
-        print(f"{'condition':22s} {'PER A':>7s} {'PER B':>7s} {'ΔPER':>7s} {'p_holm':>7s}   "
+        print("\nCharacter and phoneme metrics: CER, PER, and WPFER (PER with partial credit for close phones)")
+        print(f"{'condition':22s} {'CER A':>7s} {'CER B':>7s} {'ΔCER':>7s} {'p_holm':>7s}   "
+              f"{'PER A':>7s} {'PER B':>7s} {'ΔPER':>7s} {'p_holm':>7s}   "
               f"{'WPFER A':>7s} {'WPFER B':>7s} {'ΔWPFER':>7s} {'p_holm':>7s}")
         for _, r in df.iterrows():
-            print(f"{r.condition:22s} {phone_cols(r, 'per', has_per)}   {phone_cols(r, 'wpfer', has_wpfer)}")
+            print(f"{r.condition:22s} {phone_cols(r, 'cer', True)}   {phone_cols(r, 'per', has_per)}   "
+                  f"{phone_cols(r, 'wpfer', has_wpfer)}")
 
         # ---- Table 3: how the word errors split
         print("\nWord error types (S / D / I, % of reference words; they add up to WER)")
@@ -426,7 +436,7 @@ def main():
         clean = df[df.condition == "clean"].iloc[0] if (df.condition == "clean").any() else None
         noisy = df[df.noise.notna() & (df.speech_db_spl == 65)]
         levels = df[df.noise.isna()]
-        for metric in ["wer"] + (["per"] if has_per else []) + (["wpfer"] if has_wpfer else []):
+        for metric in ["wer", "cer"] + (["per"] if has_per else []) + (["wpfer"] if has_wpfer else []):
             if not noisy.empty:
                 plot_two_curves(noisy, metric, "snr_db", "noise", (label_a, label_b), clean, "SNR (dB)",
                                 out / f"{metric}_vs_snr.png", reverse_x=True)
