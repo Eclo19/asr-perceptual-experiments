@@ -62,12 +62,11 @@ sys.stdout.reconfigure(line_buffering=True)
 # =============================================================================
 
 # System A and system B: .pt files, _meta.json files or model names. One per seed, same seed order
-# If comparing carfac vs log mel, the convention has been to put carfac on A
 MODELS_A = [
-    "Backup_Models/Transformer_CTC_Models_Good/2026-11-03_carfac-agc-log_librispeech-train.100_clean_s30_64fdc8_meta.json",
+    "Backup_Models/Conformer_CTC_Models/2026-11-04_carfac-agc-log_librispeech-train.100_clean_s30_0b1a55_meta.json",
 ]
 MODELS_B = [
-    "Backup_Models/Transformer_CTC_Models_Good/2026-11-03_logmel80_librispeech-train.100_clean_s30_fc49ec_meta.json",
+    "models/2026-11-04_carfac-agc-log_librispeech-train.100_clean_s30_2fd4a1_meta.json",
 ]
 
 # Workspace root. None: the folder that holds models/ (inferred from the first model), else the current folder
@@ -85,7 +84,7 @@ N_BOOT = 1000
 BOOT_SEED = 0
 
 # Refuse to compare models that differ in more than front end and seed (see assert_comparable)
-REQUIRE_COMPARABLE = True
+REQUIRE_COMPARABLE = False
 
 
 # =============================================================================
@@ -306,6 +305,10 @@ def main():
 
     label_a = a_models[0][1]["frontend"]["name"]
     label_b = b_models[0][1]["frontend"]["name"]
+    # Same front end on both sides (e.g. a stem ablation): add the architecture, so labels differ
+    if label_a == label_b:
+        label_a += "+" + a_models[0][1]["model"]["arch"]
+        label_b += "+" + b_models[0][1]["model"]["arch"]
 
     # One folder per (front ends, split, recipe, seeds): the controlled hash identifies the recipe
     # (model, data, training), so e.g. Transformer and Conformer comparisons get separate folders
@@ -334,6 +337,30 @@ def main():
             print(f"  WARNING: {message}")
         else:
             print(f"  controlled hash {hashes.pop()}: comparable")
+
+        # Model and size of each side; with mixed recipes, also what differs in their configs
+        print("\nModels")
+        for side, (name, meta) in (("A", a_models[0]), ("B", b_models[0])):
+            m = meta["model"]
+            pt = root / "models" / f"{name}.pt"
+            size = f"{pt.stat().st_size / 1e6:.1f} MB" if pt.exists() else "n/a"
+            n = m.get("n_params")
+            print(f"  {side}: {m['arch']}  d_model {m['d_model']}, {m['n_layers']} layers, {m['n_heads']} heads, "
+                  f"d_ff {m['d_ff']} | {meta['frontend'].get('n_feats', '?')} features | "
+                  f"{n / 1e6:.2f} M parameters | .pt {size}" if n else f"  {side}: {m['arch']} | .pt {size}")
+        n_a, n_b = (x[0][1]["model"].get("n_params") for x in (a_models, b_models))
+        if n_a and n_b:
+            print(f"  B − A: {(n_b - n_a) / 1e6:+.2f} M parameters ({(n_b - n_a) / n_a:+.1%})")
+        if len(hashes_all := {m["controlled_hash"] for _, m in a_models + b_models}) > 1:
+            def flat(d, prefix=""):
+                out = {}
+                for k, v in d.items():
+                    out.update(flat(v, f"{prefix}{k}.") if isinstance(v, dict) else {f"{prefix}{k}": v})
+                return out
+            ca, cb = (flat({k: v for k, v in x[0][1]["config"].items() if k not in ("frontend", "seed")})
+                      for x in (a_models, b_models))
+            diffs = [f"{k}: {ca.get(k)} → {cb.get(k)}" for k in sorted(set(ca) | set(cb)) if ca.get(k) != cb.get(k)]
+            print("  Config differences (A → B): " + ("; ".join(diffs) or "none"))
         print(f"  PER: {'on (g2p_en)' if _g2p() is not None else 'off (g2p_en missing)'}   "
               f"WPFER: {'on (panphon)' if _phone_table() is not None else 'off (panphon missing)'}")
 

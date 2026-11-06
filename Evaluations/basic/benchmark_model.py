@@ -57,7 +57,7 @@ sys.stdout.reconfigure(line_buffering=True)
 # =============================================================================
 
 # The model: a .pt file, a _meta.json file, or a model name (looked up in <ROOT>/models/)
-MODEL = "models/2026-11-04_carfac-agc-log_librispeech-train.100_clean_s30_0b1a55"
+MODEL = "models/2026-11-05_mfcc40_librispeech-train.100_clean_s30_e3324d_meta.json"
 
 # Workspace root. None: the folder that holds models/ (inferred from MODEL), else the current folder
 ROOT = None

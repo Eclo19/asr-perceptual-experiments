@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 import math
 
-from asrlib import ASR, ASRConfig, CLEAN, DataConfig, LogMelConfig, ModelConfig, TrainConfig, CarfacConfig
+from asrlib import ASR, ASRConfig, CLEAN, DataConfig, LogMelConfig, ModelConfig, TrainConfig, CarfacConfig, MFCCConfig, Condition
 
 # Print immediately, line by line, even into a Slurm log
 sys.stdout.reconfigure(line_buffering=True)
@@ -55,6 +55,11 @@ logmel_fe = LogMelConfig(
     n_mels=80
 )
 
+# MFCCs 
+mfcc_fe = MFCCConfig()
+
+
+
 # For a quick check of the CARFAC model's behavior wrt these parameters, experiment on cell 
 car_params = {
     "velocity_scale": 0.1,                   # For the velocity nonlinearity
@@ -82,7 +87,7 @@ carfac_fe = CarfacConfig(
 FRONTEND = carfac_fe
 
 # ---- Data: LibriSpeech "clean", from <root>/datasets/ 
-N_TRAIN_SHARDS = 3                         # 4 ≈ 28 h (regression check); None = all 14 ≈ 100 h
+N_TRAIN_SHARDS = None                         # 4 ≈ 28 h (regression check); None = all 14 ≈ 100 h
 
 DATA = DataConfig(
     corpus="librispeech",
@@ -95,8 +100,8 @@ DATA = DataConfig(
 )
 
 # ---- Model: Transformer-CTC (≈ 5.55 M parameters with 80 mel bins)
-transformer_ctc_model_conv1d = ModelConfig(
-    arch="transformer_ctc_conv1d", # "transformer_ctc", "transformer_ctc_conv1d"
+transformer_ctc_model = ModelConfig(
+    arch="transformer_ctc", # "transformer_ctc", "transformer_ctc_conv1d"
     d_model=384,
     n_heads=6,
     n_layers=6,
@@ -114,7 +119,7 @@ conformer_ctc_model = ModelConfig(
     dropout=0.1
 )
 
-MODEL = conformer_ctc_model
+MODEL = transformer_ctc_model
 
 
 # ---- Training recipe 
@@ -190,7 +195,7 @@ def main():
 
     # Score on test-clean (clean speech at the training level), with a 95% bootstrap interval
     print("\nStarting evaluation...\n")
-    result = asr.evaluate(split="validation", condition=Condition("white", 10))
+    result = asr_basic.evaluate(split="validation", condition=Condition("white", 10))
     lo, hi = result.wer_ci
     print(f"\nTEST {asr_basic.name}\n  WER {result.wer:.2%}  (95% CI {lo:.2%}–{hi:.2%})  CER {result.cer:.2%}  "
           f"over {result.n_utts} utterances")

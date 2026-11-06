@@ -1,4 +1,3 @@
-
 """
 Important configurations for the ASR class. This is the source of truth for what a system IS. 
 
@@ -101,10 +100,25 @@ class LogMelConfig(FrontEndConfig):
     n_mels: int = 80
     win_ms: float = 25.0
     log_eps: float = field(default=1e-8, metadata={"cache": False})
+    # Highest mel filter edge in Hz; None = Nyquist (8 kHz). 7600 matches CARFAC's top channel
+    f_max: float | None = None
 
     @property
     def name(self) -> str:
-        return f"logmel{self.n_mels}"
+        return f"logmel{self.n_mels}" + (f"-f{self.f_max:g}" if self.f_max is not None else "")
+
+    # f_max is left out of the dict while None, so models trained before it existed keep their hashes
+    def to_dict(self) -> dict:
+        d = super().to_dict()
+        if d.get("f_max") is None:
+            d.pop("f_max", None)
+        return d
+
+    def cache_dict(self) -> dict:
+        d = super().cache_dict()
+        if d.get("f_max") is None:
+            d.pop("f_max", None)
+        return d
 
 
 @dataclass(frozen=True)

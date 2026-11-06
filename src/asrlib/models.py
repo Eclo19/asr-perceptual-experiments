@@ -283,6 +283,8 @@ class ConformerCTC(TransformerCTC):
     STEM = "conv1d"
     CONV_KERNEL = 31
 
+    # Subclass below swaps the stem: the encoder and everything else stay identical
+
     def __init__(self, n_feats: int, vocab_size: int, d_model=256, n_heads=4, n_layers=12,
                  d_ff=1024, dropout=0.1, subsample_channels=128, subsample_factor=4,
                  blank_id: int = 0, arch=None):
@@ -321,3 +323,13 @@ class ConformerCTC(TransformerCTC):
         x = x[:, : int(out_lens.max())]                                          # (B, max(out_lens), d)
         x, _ = self.encoder(self.pos(x), out_lens)                               # (B, T', d); pads masked
         return self.head(x).log_softmax(dim=-1), out_lens                        # (B, T', V), (B,)
+
+
+@register("model", "conformer_ctc_conv2d")
+class ConformerCTCConv2d(ConformerCTC):
+    """ConformerCTC with the Conv2d stem (two stride-2 3×3 convolutions over time × frequency),
+    as in TransformerCTC. Everything after the stem is identical:
+
+        ModelConfig(arch="conformer_ctc_conv2d", d_model=256, n_heads=4, n_layers=12, d_ff=1024, dropout=0.1)
+    """
+    STEM = "conv2d"

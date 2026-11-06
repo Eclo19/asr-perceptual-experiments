@@ -90,6 +90,7 @@ class LogMel(FrontEnd):
             win_length=win_length,
             hop_length=HOP_LENGTH,
             n_mels=cfg.n_mels,
+            f_max=cfg.f_max,                         # None = Nyquist
         )
 
     def extract(self, wave: torch.Tensor) -> torch.Tensor:
@@ -278,3 +279,4 @@ class CARFAC(FrontEnd):
         if self.cfg.post == "cuberoot":
             return rate.pow(1 / 3)
         return raw
+        
