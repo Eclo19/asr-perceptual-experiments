@@ -83,6 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="logmel / mfcc = baselines with the same recipe (CARFAC options are ignored)")
     run.add_argument("--arch", choices=("conformer_ctc", "conformer_ctc_conv2d"), default="conformer_ctc",
                      help="stem ablation: conformer_ctc = Conv1d stem, conformer_ctc_conv2d = Conv2d stem")
+    run.add_argument("--peak-lr", type=float, default=5e-4,
+                     help="peak learning rate (5e-4 = the main recipe; lower only for runs that don't converge)")
     run.add_argument("--subsample-channels", type=int, default=128,
                      help="Conv2d stem width (48 ≈ the Conv1d stem's parameter count); the Conv1d stem ignores it")
     run.add_argument("--pooling", choices=("hann25", "box10"), default="hann25", help="CARFAC frame pooling")
@@ -167,7 +169,7 @@ def main():
     frontend = build_frontend(a)
     data = DataConfig(corpus="librispeech", train_split="train.100", n_train_shards=a.shards or None,
                       val_split="validation", test_split="test", source="auto", max_train_seconds=None)
-    cfg = ASRConfig(frontend=frontend, model=ModelConfig(arch=a.arch, subsample_channels=a.subsample_channels, **MODEL_KW), data=data, train=TrainConfig(epochs=a.epochs, **TRAIN_KW),
+    cfg = ASRConfig(frontend=frontend, model=ModelConfig(arch=a.arch, subsample_channels=a.subsample_channels, **MODEL_KW), data=data, train=TrainConfig(epochs=a.epochs, **{**TRAIN_KW, "peak_lr": a.peak_lr}),
                     norm=NORM, tokenizer="char", seed=a.seed)
 
     label = changed_options(a, parser)

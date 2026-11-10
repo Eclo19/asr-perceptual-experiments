@@ -2,7 +2,8 @@
 Front ends across conditions: WER and CER vs SNR and vs level, one line per front end, plus LaTeX tables.
 
 Set the globals below and press Run in VS Code (or `python frontend_conditions.py`). Needs no GPU:
-it reads the scores benchmark_model.py saved in models/<name>_meta.json ("evaluations").
+it finds each model's meta by config hash in models/ and, recursively, in Backup_Models/, and reads
+the per-utterance results in results/<name>/per_utt/ (or the scores saved in the meta).
 
 Outputs go to results/compare/frontends_<split>_<controlled hash>/:
     wer_conditions.png / .pdf    WER vs SNR (white noise) | WER vs level, one line per front end
@@ -36,10 +37,14 @@ ROOT = Path(os.environ.get("ASRLIB_ROOT", Path().resolve()))
 
 # Models by config hash, with the label shown in plots and tables (order = legend and column order)
 MODELS = {
-    "5e707d": "CARFAC",
-    "f2c83a": "Log-mel",
-    "e3324d": "MFCC",
+    "2fd4a1": "CARFAC",
+    "7215fa": "Log-mel",
+    "19f103": "MFCC",
 }
+
+# Folders searched for <name>_meta.json, in order; subfolders included. A model found in several
+# (e.g. models/ and a backup copy) is the same model: the first one is used
+SEARCH_DIRS = ["models", "Backup_Models"]
 
 SPLIT = "test"
 
@@ -56,10 +61,18 @@ TRAIN_LEVEL_DB = 65
 # =============================================================================
 
 def load(config_hash: str) -> dict:
-    """The meta of the one model in models/ whose config hash matches."""
-    hits = [p for p in (ROOT / "models").glob(f"*_{config_hash}_meta.json")]
-    if len(hits) != 1:
-        sys.exit(f"Expected one model with config hash {config_hash}, found {len(hits)}")
+    """The meta of the model with this config hash, searched recursively in SEARCH_DIRS."""
+    hits = []
+    for folder in SEARCH_DIRS:
+        hits += sorted((ROOT / folder).rglob(f"*_{config_hash}_meta.json"))
+    if not hits:
+        sys.exit(f"No model with config hash {config_hash} in {SEARCH_DIRS} (subfolders included)")
+
+    # Copies of one model share a file name; different names would mean two different models
+    names = {p.name for p in hits}
+    if len(names) > 1:
+        sys.exit(f"Config hash {config_hash} matches different models: {sorted(names)}")
+    print(f"  {config_hash}: {hits[0].relative_to(ROOT)}" + (f" (+{len(hits) - 1} copies)" if len(hits) > 1 else ""))
     return json.loads(hits[0].read_text())
 
 

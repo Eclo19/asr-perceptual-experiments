@@ -63,11 +63,17 @@ sys.stdout.reconfigure(line_buffering=True)
 
 # System A and system B: .pt files, _meta.json files or model names. One per seed, same seed order
 MODELS_A = [
-    "Backup_Models/Conformer_CTC_Models/2026-11-04_carfac-agc-log_librispeech-train.100_clean_s30_0b1a55_meta.json",
+    "models/2026-11-06_carfac-agc-log-box10_librispeech-train.100_clean_s30_4f1481_meta.json",
 ]
 MODELS_B = [
-    "models/2026-11-04_carfac-agc-log_librispeech-train.100_clean_s30_2fd4a1_meta.json",
+    "models/2026-11-06_carfac-agc-log_librispeech-train.100_clean_s30_2c6727_meta.json",
 ]
+
+# Names of A and B in the plots and tables, e.g. "CARFAC" / "Log-mel" to match the thesis text.
+# None: the front-end name (plus the architecture when both sides share a front end), as before.
+# Output folder names always use the front-end names, so they don't change with these
+NAME_A = "box_10" # None
+NAME_B = "hann25" # None
 
 # Workspace root. None: the folder that holds models/ (inferred from the first model), else the current folder
 ROOT = None
@@ -84,7 +90,7 @@ N_BOOT = 1000
 BOOT_SEED = 0
 
 # Refuse to compare models that differ in more than front end and seed (see assert_comparable)
-REQUIRE_COMPARABLE = False
+REQUIRE_COMPARABLE = True
 
 
 # =============================================================================
@@ -206,7 +212,7 @@ def paired_stats(pairs: list[tuple[pd.DataFrame, pd.DataFrame]], n_boot: int, se
             "a_lo": np.quantile(boot_a, q[0]), "a_hi": np.quantile(boot_a, q[1]),
             "b_lo": np.quantile(boot_b, q[0]), "b_hi": np.quantile(boot_b, q[1]),
             "delta_lo": np.quantile(deltas, q[0]), "delta_hi": np.quantile(deltas, q[1]),
-            "p": p, "per_seed": per_seed,
+            "p": p, "p_a_better": (deltas < 0).mean(), "per_seed": per_seed,
             "seeds_agree": all(d > 0 for d in per_seed) or all(d < 0 for d in per_seed)}
 
 
@@ -310,6 +316,10 @@ def main():
         label_a += "+" + a_models[0][1]["model"]["arch"]
         label_b += "+" + b_models[0][1]["model"]["arch"]
 
+    # Display names (plots and tables); the folder name below keeps the labels
+    disp_a = NAME_A or label_a
+    disp_b = NAME_B or label_b
+
     # One folder per (front ends, split, recipe, seeds): the controlled hash identifies the recipe
     # (model, data, training), so e.g. Transformer and Conformer comparisons get separate folders
     all_hashes = sorted({m["controlled_hash"] for _, m in a_models + b_models})
@@ -321,7 +331,7 @@ def main():
     sys.stdout = tee
 
     try:
-        print(f"A = {label_a}   B = {label_b}   split {SPLIT}   {len(a_models)} seed pair(s)")
+        print(f"A = {disp_a}   B = {disp_b}   split {SPLIT}   {len(a_models)} seed pair(s)")
         for (na, ma), (nb, mb) in zip(a_models, b_models):
             print(f"  A {na}\n  B {nb}")
             if ma["seed"] != mb["seed"]:
@@ -405,7 +415,7 @@ def main():
             df["wpfer_p_holm"] = holm(df.wpfer_p.tolist())
         df["verdict"] = np.where(
             (df.wer_p_holm < 0.05) & df.wer_seeds_agree,
-            np.where(df.wer_delta < 0, f"{label_a} better", f"{label_b} better"),
+            np.where(df.wer_delta < 0, f"{disp_a} better", f"{disp_b} better"),
             "no clear difference")
 
         # Order: clean first, then each noise by SNR (high to low), then the level sweep
@@ -418,13 +428,13 @@ def main():
                   "(re-run benchmark_model.py to store them)")
 
         # ---- Table 1: WER, the primary metric
-        print(f"\nWER   (A = {label_a}, B = {label_b})")
+        print(f"\nWER   (A = {disp_a}, B = {disp_b}; P(A<B) = share of bootstrap draws where A has the lower WER)")
         print(f"{'condition':22s} {'A':>7s} {'B':>7s} {'ΔWER':>7s} {'95% CI of Δ':>17s} "
-              f"{'p':>6s} {'p_holm':>7s} {'seeds':>6s}  verdict")
+              f"{'P(A<B)':>7s} {'p':>6s} {'p_holm':>7s} {'seeds':>6s}  verdict")
         for _, r in df.iterrows():
             agree = "agree" if r.wer_seeds_agree else "split"
             print(f"{r.condition:22s} {r.wer_a:7.2%} {r.wer_b:7.2%} {r.wer_delta * 100:+6.2f}  "
-                  f"[{r.wer_delta_lo * 100:+6.2f}, {r.wer_delta_hi * 100:+6.2f}] {r.wer_p:6.3f} "
+                  f"[{r.wer_delta_lo * 100:+6.2f}, {r.wer_delta_hi * 100:+6.2f}] {r.wer_p_a_better:7.3f} {r.wer_p:6.3f} "
                   f"{r.wer_p_holm:7.3f} {agree:>6s}  {r.verdict}")
 
         # ---- Table 2: phoneme-level metrics
@@ -466,17 +476,17 @@ def main():
         levels = df[df.noise.isna()]
         for metric in ["wer", "cer"] + (["per"] if has_per else []) + (["wpfer"] if has_wpfer else []):
             if not noisy.empty:
-                plot_two_curves(noisy, metric, "snr_db", "noise", (label_a, label_b), clean, "SNR (dB)",
+                plot_two_curves(noisy, metric, "snr_db", "noise", (disp_a, disp_b), clean, "SNR (dB)",
                                 out / f"{metric}_vs_snr.png", reverse_x=True)
             if len(levels) > 1:
-                plot_two_curves(levels, metric, "speech_db_spl", None, (label_a, label_b), None,
+                plot_two_curves(levels, metric, "speech_db_spl", None, (disp_a, disp_b), None,
                                 "speech level (dB SPL)", out / f"{metric}_vs_level.png")
         if not noisy.empty:
-            plot_delta(noisy, "snr_db", "noise", "SNR (dB)", f"ΔWER, {label_a} − {label_b}",
+            plot_delta(noisy, "snr_db", "noise", "SNR (dB)", f"ΔWER, {disp_a} − {disp_b}",
                        out / "delta_vs_snr.png", reverse_x=True)
         if len(levels) > 1:
             plot_delta(levels, "speech_db_spl", None, "speech level (dB SPL)",
-                       f"ΔWER, {label_a} − {label_b}", out / "delta_vs_level.png")
+                       f"ΔWER, {disp_a} − {disp_b}", out / "delta_vs_level.png")
 
         print(f"\nSaved to {out}")
         for f in sorted(out.iterdir()):
