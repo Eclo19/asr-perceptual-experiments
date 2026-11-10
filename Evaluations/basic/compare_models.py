@@ -63,17 +63,17 @@ sys.stdout.reconfigure(line_buffering=True)
 
 # System A and system B: .pt files, _meta.json files or model names. One per seed, same seed order
 MODELS_A = [
-    "models/2026-11-06_carfac-agc-log-box10_librispeech-train.100_clean_s30_4f1481_meta.json",
+    "Backup_Models/conformer_conv2d_small/2026-11-09_carfac-agc-log_librispeech-train.100_clean_s31_f0ff9b_meta.json",
 ]
 MODELS_B = [
-    "models/2026-11-06_carfac-agc-log_librispeech-train.100_clean_s30_2c6727_meta.json",
+    "Backup_Models/Conformer_CTC_Models/2026-11-04_carfac-agc-log_librispeech-train.100_clean_s30_0b1a55_meta.json",
 ]
 
 # Names of A and B in the plots and tables, e.g. "CARFAC" / "Log-mel" to match the thesis text.
 # None: the front-end name (plus the architecture when both sides share a front end), as before.
 # Output folder names always use the front-end names, so they don't change with these
-NAME_A = "box_10" # None
-NAME_B = "hann25" # None
+NAME_A = "2D Stem" # None
+NAME_B = "1D Stem" # None
 
 # Workspace root. None: the folder that holds models/ (inferred from the first model), else the current folder
 ROOT = None
@@ -90,7 +90,7 @@ N_BOOT = 1000
 BOOT_SEED = 0
 
 # Refuse to compare models that differ in more than front end and seed (see assert_comparable)
-REQUIRE_COMPARABLE = True
+REQUIRE_COMPARABLE = False
 
 
 # =============================================================================

@@ -84,14 +84,14 @@ carfac_fe = CarfacConfig(
     pooling="hann25",
 )
 
-FRONTEND = carfac_fe
+FRONTEND = logmel_fe
 
 # ---- Data: LibriSpeech "clean", from <root>/datasets/ 
 N_TRAIN_SHARDS = None                         # 4 ≈ 28 h (regression check); None = all 14 ≈ 100 h
 
 DATA = DataConfig(
     corpus="librispeech",
-    train_split="train.100",
+    train_split="train.360",
     n_train_shards=N_TRAIN_SHARDS,
     val_split="validation",                # dev-clean: model selection
     test_split="test",                     # test-clean: scored once, at the end
@@ -119,7 +119,7 @@ conformer_ctc_model = ModelConfig(
     dropout=0.1
 )
 
-MODEL = transformer_ctc_model
+MODEL = conformer_ctc_model
 
 
 # ---- Training recipe 
@@ -149,11 +149,11 @@ TRAIN = TrainConfig(
     max_frames_per_batch=35_000,       # ~1,000 steps per epoch
     grad_clip=1.0,
     amp="auto",
-    specaugment={"freq_masks": 2, "freq_width": 27, "time_masks": 2, "time_width": 50,
+    specaugment={"freq_masks": 4, "freq_width": 27, "time_masks": 4, "time_width": 50,
                  "scale_freq_to_n_feats": True},
     train_conditions=(CLEAN,),
     n_noisy_variants=0,
-    early_stop_patience=None,
+    early_stop_patience=10,
     num_workers=6,
 )
 
