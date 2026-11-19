@@ -143,10 +143,10 @@ TRAIN = TrainConfig(
 
 TRAIN = TrainConfig(
     epochs=100,                        # Conformers keep improving longer; ~2–3 h at this speed
-    peak_lr=5e-4,
-    warmup_steps=10_000,                 
+    peak_lr=4e-4,
+    warmup_steps=30_000,                 
     weight_decay=0.01,
-    max_frames_per_batch=35_000,       # ~1,000 steps per epoch
+    max_frames_per_batch=35_000,       # 
     grad_clip=1.0,
     amp="auto",
     specaugment={"freq_masks": 4, "freq_width": 27, "time_masks": 4, "time_width": 50,

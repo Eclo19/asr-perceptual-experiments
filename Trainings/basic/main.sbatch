@@ -7,7 +7,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8                 # 6 DataLoader workers + main process + spare
 #SBATCH --mem=32G
-#SBATCH --job-name=main_train_carfac_transformer_ctc
+#SBATCH --job-name=main_train_logmel_new_arch_360
 #SBATCH --output=logs/%x_%j.out           # logs/main_<jobid>.out
 
 # Stop at the first error

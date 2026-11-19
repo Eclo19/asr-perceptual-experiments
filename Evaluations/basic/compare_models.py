@@ -63,17 +63,17 @@ sys.stdout.reconfigure(line_buffering=True)
 
 # System A and system B: .pt files, _meta.json files or model names. One per seed, same seed order
 MODELS_A = [
-    "Backup_Models/conformer_conv2d_small/2026-11-09_carfac-agc-log_librispeech-train.100_clean_s31_f0ff9b_meta.json",
+    "models/2026-11-11_carfac-agc-log_librispeech-train.360_clean_s30_984ff9_meta.json",
 ]
 MODELS_B = [
-    "Backup_Models/Conformer_CTC_Models/2026-11-04_carfac-agc-log_librispeech-train.100_clean_s30_0b1a55_meta.json",
+    "models/2026-11-11_mfcc40_librispeech-train.360_clean_s30_1376d5_meta.json",
 ]
 
 # Names of A and B in the plots and tables, e.g. "CARFAC" / "Log-mel" to match the thesis text.
 # None: the front-end name (plus the architecture when both sides share a front end), as before.
 # Output folder names always use the front-end names, so they don't change with these
-NAME_A = "2D Stem" # None
-NAME_B = "1D Stem" # None
+NAME_A = "CARFAC_New" # None
+NAME_B = "MFCC_New" # None
 
 # Workspace root. None: the folder that holds models/ (inferred from the first model), else the current folder
 ROOT = None
@@ -90,7 +90,7 @@ N_BOOT = 1000
 BOOT_SEED = 0
 
 # Refuse to compare models that differ in more than front end and seed (see assert_comparable)
-REQUIRE_COMPARABLE = False
+REQUIRE_COMPARABLE = True
 
 
 # =============================================================================
@@ -271,7 +271,7 @@ def plot_two_curves(df: pd.DataFrame, metric: str, x: str, group: str | None, la
 
 def plot_delta(df: pd.DataFrame, x: str, group: str | None, xlabel: str, title: str,
                out: Path, reverse_x: bool = False) -> None:
-    """ΔWER with its 95% interval; below zero = A better, above zero = B better."""
+    f"""ΔWER with its 95% interval; below zero = {NAME_A} better, above zero = {NAME_B} better."""
     fig, ax = plt.subplots(figsize=(7, 4.5))
     groups = df.groupby(group, sort=False) if group else [("clean speech", df)]
     for label, g in groups:
@@ -283,7 +283,7 @@ def plot_delta(df: pd.DataFrame, x: str, group: str | None, xlabel: str, title: 
     if reverse_x:
         ax.invert_xaxis()
     ax.set(xlabel=xlabel, ylabel="ΔWER = A − B (points)", title=title)
-    ax.text(0.01, 0.02, "below 0: A better   above 0: B better", transform=ax.transAxes, fontsize=9,
+    ax.text(0.01, 0.02, f"below 0: {NAME_A} better   above 0: {NAME_B} better", transform=ax.transAxes, fontsize=9,
             color="gray")
     ax.grid(alpha=0.3)
     ax.legend()

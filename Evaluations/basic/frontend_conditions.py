@@ -37,9 +37,9 @@ ROOT = Path(os.environ.get("ASRLIB_ROOT", Path().resolve()))
 
 # Models by config hash, with the label shown in plots and tables (order = legend and column order)
 MODELS = {
-    "2fd4a1": "CARFAC",
-    "7215fa": "Log-mel",
-    "19f103": "MFCC",
+    "74dda4": "CARFAC",
+    "cd7c95": "Log-mel",
+    "5cd4fb": "MFCC",
 }
 
 # Folders searched for <name>_meta.json, in order; subfolders included. A model found in several
