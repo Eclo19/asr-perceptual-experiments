@@ -57,7 +57,7 @@ sys.stdout.reconfigure(line_buffering=True)
 # =============================================================================
 
 # The model: a .pt file, a _meta.json file, or a model name (looked up in <ROOT>/models/)
-MODEL = "models/2026-11-11_carfac-agc-log_librispeech-train.360_clean_s30_984ff9_meta.json"
+MODEL = "Backup_Models/conformer_ctc_360_new/2026-11-11_carfac-agc-log_librispeech-train.360_clean_s30_984ff9_meta.json"
 
 # Workspace root. None: the folder that holds models/ (inferred from MODEL), else the current folder
 ROOT = None
@@ -69,7 +69,8 @@ DEVICE = None
 CLEAN_SPLITS = ("validation", "test")
 
 # Noise sweep, on the test split. Kinds without recordings in noise/ are skipped ("white" is always there)
-NOISES = ("white",) #("white", "pub", "babble", "pub_whisper")
+# NOISES = ("white", "cafeteria", "kitchen", "babble") #("white", "cafeteria", "car", "kitchen", "office", "babble")
+NOISES = ("white", "cafeteria", "kitchen", "car", "office", "babble") 
 SNRS = (40, 30, 20, 10, 5, 0, -5, -10)      # dB, the same grid as Whisper's noise robustness figure
 
 # Level sweep of clean speech, dB SPL (65 = the default training level)
