@@ -126,11 +126,12 @@ class ASR:
                      **dataclasses.asdict(self.cfg.model))
 
     def _build_featurizer(self) -> Featurizer:
-        # All training conditions must share one speech level: it's the level transcribe() matches
-        levels = {c.speech_db_spl for c in self.cfg.train.train_conditions}
+        # All training conditions must share one reference level (a fixed level, or the middle of a
+        # level_range): it's the level validation and transcribe() calibrate to
+        levels = {c.reference_db_spl for c in self.cfg.train.train_conditions}
         if len(levels) != 1:
-            raise ValueError(f"Training conditions use several speech levels {sorted(levels)}; "
-                             "use one, so transcribe() knows which level to calibrate to")
+            raise ValueError(f"Training conditions are centred on several speech levels {sorted(levels)}; "
+                             "centre them on one, so validation and transcribe() know which level to use")
         return Featurizer(self.frontend, self.normalizer, self.cfg.train.specaugment,
                           train_level_db_spl=levels.pop())
 
@@ -299,13 +300,13 @@ class ASR:
                 n_variants: int = 0) -> list[CachedFeatures]:
         """One CachedFeatures per (condition, variant), built here in the main process if missing.
 
-        Same order as FeatureDataset.items: for each condition, variants 0..K-1 if noisy, else just 0.
+        Same order as FeatureDataset.items: for each condition, variants 0..K-1 if random, else just 0.
         """
         store = self.feature_store()
         caches = []
         for c in conditions:
-            for v in range(max(1, n_variants) if c.noise else 1):
-                variant = v if (c.noise and n_variants > 0) else None
+            for v in range(max(1, n_variants) if c.is_random else 1):
+                variant = v if (c.is_random and n_variants > 0) else None
                 caches.append(store.get(self.frontend, corpus, c, bank=bank, variant=variant))
         return caches
 
@@ -338,18 +339,19 @@ class ASR:
 
         total = total_sq = None
         n_frames = 0
+        n_copies = [max(1, t.n_noisy_variants) if c.is_random else 1 for c in conditions]
         for k, cond in enumerate(conditions):
-            # _caches lists one cache per (condition, variant): the first variant of condition k
-            cache = None
-            if caches is not None:
-                cache = caches[sum(max(1, t.n_noisy_variants) if c.noise else 1 for c in conditions[:k])]
+            # _caches lists one cache per (condition, variant): condition k's first one is at `first`
+            first = sum(n_copies[:k])
 
-            for i in utts:
-                if cache is not None:
-                    raw = cache[int(i)]
+            for n_i, i in enumerate(utts):
+                # Spread the utterances over the variants, so a level range is sampled across its draws
+                v = n_i % n_copies[k]
+                if caches is not None:
+                    raw = caches[first + v][int(i)]
                 else:
                     utt = corpus[int(i)]
-                    raw = self.frontend.extract(cond.apply(utt.wave, utt.utt_id, bank=bank))
+                    raw = self.frontend.extract(cond.apply(utt.wave, utt.utt_id, bank=bank, variant=v))
 
                 # Accumulate in float64: millions of frames
                 feats = self.frontend.post(raw.float()).double()                    # (T, F)
@@ -380,10 +382,17 @@ class ASR:
                               max_seconds=self.cfg.data.max_train_seconds if train else None)
 
     def _make_loader(self, dataset, train: bool, n_frames: np.ndarray | None = None) -> DataLoader:
-        """DataLoader with LengthBucketSampler(max_frames_per_batch) and collate()."""
+        """DataLoader with LengthBucketSampler(max_frames_per_batch) and collate().
+
+        Training with mix="sample": one (condition, variant) copy per utterance per epoch.
+        """
+        groups = 1
+        if train and n_frames is None and self.cfg.train.mix == "sample" and len(dataset.items) > 1:
+            groups = len(dataset.items)
+            n_frames = dataset.utterance_frames()
         n_frames = dataset.n_frames() if n_frames is None else n_frames
         sampler = LengthBucketSampler(n_frames, self.cfg.train.max_frames_per_batch,
-                                      shuffle=train, seed=self.cfg.seed)
+                                      shuffle=train, seed=self.cfg.seed, groups=groups)
         workers = self.cfg.train.num_workers
         return DataLoader(dataset, batch_sampler=sampler, collate_fn=collate, num_workers=workers,
                           pin_memory=self.device.type == "cuda", persistent_workers=workers > 0)

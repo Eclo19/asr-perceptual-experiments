@@ -10,6 +10,11 @@ it changes:
     python Trainings/carfac_sweep/sweep.py --frontend logmel        # Log-mel baseline, same recipe
     python Trainings/carfac_sweep/sweep.py --max-zeta 0.5 --dry-run # Check the design, don't train
 
+Multi-level training (every utterance at a random level from 45–85 dB SPL; 3 cached draws per
+utterance; each epoch uses one draw per utterance, so epochs stay as long as clean training):
+
+    python Trainings/ablations/sweep.py --shards 0 --level-range 45 85 --variants 3 --mix sample
+
 Launch from the repo root (the workspace is the folder you launch from, or --root / $ASRLIB_ROOT).
 On Quest, submit runs with Trainings/carfac_sweep/submit_sweep.sh, which wraps this in sbatch jobs.
 
@@ -33,7 +38,7 @@ import os
 import sys
 from pathlib import Path
 
-from asrlib import ASR, ASRConfig, CLEAN, CarfacConfig, Condition, DataConfig, LogMelConfig, ModelConfig, TrainConfig
+from asrlib import ASR, ASRConfig, CLEAN, CarfacConfig, Condition, DataConfig, LogMelConfig, MFCCConfig, ModelConfig, TrainConfig
 
 # Print immediately, line by line, even into a Slurm log
 sys.stdout.reconfigure(line_buffering=True)
@@ -43,7 +48,8 @@ sys.stdout.reconfigure(line_buffering=True)
 # FIXED: identical for every sweep run
 # =============================================================================
 
-MODEL = ModelConfig(arch="conformer_ctc", d_model=256, n_heads=4, n_layers=12, d_ff=1024, dropout=0.1)
+# Encoder size: the stem (arch) is an option below, for the stem ablation
+MODEL_KW = dict(d_model=256, n_heads=4, n_layers=12, d_ff=1024, dropout=0.1)
 
 TRAIN_KW = dict(
     peak_lr=5e-4,
@@ -78,8 +84,25 @@ def build_parser() -> argparse.ArgumentParser:
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     run = p.add_argument_group("run")
-    run.add_argument("--frontend", choices=("carfac", "logmel"), default="carfac",
-                     help="logmel = baseline with the same recipe (CARFAC options are ignored)")
+    run.add_argument("--frontend", choices=("carfac", "logmel", "mfcc"), default="carfac",
+                     help="logmel / mfcc = baselines with the same recipe (CARFAC options are ignored)")
+    run.add_argument("--arch", choices=("conformer_ctc", "conformer_ctc_conv2d"), default="conformer_ctc",
+                     help="stem ablation: conformer_ctc = Conv1d stem, conformer_ctc_conv2d = Conv2d stem")
+    run.add_argument("--peak-lr", type=float, default=5e-4,
+                     help="peak learning rate (5e-4 = the main recipe; lower only for runs that don't converge)")
+    run.add_argument("--subsample-channels", type=int, default=128,
+                     help="Conv2d stem width (48 ≈ the Conv1d stem's parameter count); the Conv1d stem ignores it")
+    run.add_argument("--pooling", choices=("hann25", "box10"), default="hann25", help="CARFAC frame pooling")
+    run.add_argument("--level-range", type=float, nargs=2, default=None, metavar=("LOW", "HIGH"),
+                     help="train on clean speech at a random level from LOW to HIGH dB SPL per utterance "
+                          "(default: every utterance at 65 dB SPL)")
+    run.add_argument("--variants", type=int, default=0,
+                     help="draws per utterance of a random training condition (each cached for CARFAC)")
+    run.add_argument("--mix", choices=("concat", "sample"), default="concat",
+                     help="sample: one draw per utterance per epoch (epoch length as clean); "
+                          "concat: every draw every epoch")
+    run.add_argument("--f-max", type=float, default=None,
+                     help="log-mel top filter edge in Hz (7600 = CARFAC's range); default Nyquist")
     run.add_argument("--shards", type=int, default=3, help="LibriSpeech train.100 shards (~7 h each); 0 = all 14")
     run.add_argument("--epochs", type=int, default=100)
     run.add_argument("--seed", type=int, default=30)
@@ -118,7 +141,9 @@ def build_frontend(a: argparse.Namespace):
     """The front-end config from the options. Only non-default AGC/IHC entries are passed, so the
     reference run's config (and hash, and caches) matches Trainings/basic/main.py exactly."""
     if a.frontend == "logmel":
-        return LogMelConfig(n_mels=80)
+        return LogMelConfig(n_mels=80) if a.f_max is None else LogMelConfig(n_mels=80, f_max=a.f_max)
+    if a.frontend == "mfcc":
+        return MFCCConfig()
 
     car_params = {
         "velocity_scale": a.velocity_scale, "v_offset": a.v_offset,
@@ -135,7 +160,7 @@ def build_frontend(a: argparse.Namespace):
     ihc_params = {} if a.tau_lpf == IHC_TAU_LPF else {"tau_lpf": a.tau_lpf}
 
     return CarfacConfig(car_params=car_params, agc_params=agc_params, ihc_params=ihc_params,
-                        open_loop=a.open_loop, post=a.post, pooling="hann25")
+                        open_loop=a.open_loop, post=a.post, pooling=a.pooling)
 
 
 def changed_options(a: argparse.Namespace, parser: argparse.ArgumentParser) -> str:
@@ -145,7 +170,10 @@ def changed_options(a: argparse.Namespace, parser: argparse.ArgumentParser) -> s
     for key, value in vars(a).items():
         default = parser.get_default(key)
         # nargs options come back as lists, their defaults are tuples: compare as tuples
-        same = tuple(value) == tuple(default) if isinstance(value, (list, tuple)) else value == default
+        if isinstance(value, (list, tuple)) and default is not None:
+            same = tuple(value) == tuple(default)
+        else:
+            same = value == default
         if key not in skip and not same:
             diffs.append(f"{key}={' '.join(map(str, value)) if isinstance(value, (list, tuple)) else value}")
     return ", ".join(diffs) or "reference"
@@ -157,11 +185,19 @@ def main():
     frontend = build_frontend(a)
     data = DataConfig(corpus="librispeech", train_split="train.100", n_train_shards=a.shards or None,
                       val_split="validation", test_split="test", source="auto", max_train_seconds=None)
-    cfg = ASRConfig(frontend=frontend, model=MODEL, data=data, train=TrainConfig(epochs=a.epochs, **TRAIN_KW),
+    # Training conditions: clean at 65 dB SPL, or clean at a random level per utterance
+    train_kw = {**TRAIN_KW, "peak_lr": a.peak_lr, "n_noisy_variants": a.variants, "mix": a.mix}
+    if a.level_range:
+        train_kw["train_conditions"] = (Condition(level_range=tuple(a.level_range)),)
+    cfg = ASRConfig(frontend=frontend,
+                    model=ModelConfig(arch=a.arch, subsample_channels=a.subsample_channels, **MODEL_KW),
+                    data=data, train=TrainConfig(epochs=a.epochs, **train_kw),
                     norm=NORM, tokenizer="char", seed=a.seed)
 
     label = changed_options(a, parser)
     print(f"RUN  {label}\n  config {cfg.hash()} | controlled {cfg.controlled_hash()} | front end {frontend.name}")
+    t = cfg.train
+    print(f"  training {[c.name for c in t.train_conditions]} | variants {t.n_noisy_variants} | mix {t.mix}")
 
     if a.dry_run:
         # Build the CARFAC design without data or training: catches invalid parameters in seconds

@@ -261,16 +261,35 @@ class TrainConfig:
         # Open item from notebook 06: scale freq_width by n_feats / 80, so 65 CARFAC
         # channels lose the same FRACTION of the axis as 80 mel bins
         "scale_freq_to_n_feats": True})
-    train_conditions: tuple[Condition, ...] = (CLEAN,)   # Phase 2: add noisy training conditions
-    n_noisy_variants: int = 0               # Phase 2: K cached noisy copies per utterance
+    train_conditions: tuple[Condition, ...] = (CLEAN,)   # Several: multi-condition (noise and/or level) training
+    # K copies per utterance of every RANDOM condition (noise and/or level_range), each with its own
+    # seeded draw; cached for CARFAC. (The name predates level ranges; kept so old hashes don't change.)
+    n_noisy_variants: int = 0
     early_stop_patience: int | None = 8
     num_workers: int = 2
+    # How the (condition, variant) copies of the training set are used:
+    #   "concat"  every copy of every utterance, every epoch (an epoch is K x conditions longer)
+    #   "sample"  each epoch, each utterance appears once, as one copy picked at random (seeded by
+    #             seed and epoch): epochs stay as long as clean training, and all copies are seen over time
+    mix: Literal["concat", "sample"] = "concat"
+
+    def __post_init__(self):
+        # JSON turns the tuple of Conditions into a list; keep a tuple so configs compare and hash alike
+        object.__setattr__(self, "train_conditions", tuple(self.train_conditions))
+        if self.mix not in ("concat", "sample"):
+            raise ValueError(f"mix must be 'concat' or 'sample', not {self.mix!r}")
 
     @property
     def noise_tag(self) -> str:
-        """'clean' or e.g. 'multi-babble+pub', for model names."""
+        """'clean', 'multi-babble+pub', 'clean-lvl45-85', ... for model names."""
         kinds = sorted({c.noise for c in self.train_conditions if c.noise})
-        return "clean" if not kinds else "multi-" + "+".join(kinds)
+        tag = "clean" if not kinds else "multi-" + "+".join(kinds)
+
+        # Level ranges appear in the name too (absent for fixed levels, so old names don't change)
+        ranges = sorted({c.level_range for c in self.train_conditions if c.level_range})
+        for low, high in ranges:
+            tag += f"-lvl{low:g}-{high:g}"
+        return tag
 
 
 @dataclass(frozen=True)
@@ -294,6 +313,16 @@ class ASRConfig:
         d = dataclasses.asdict(self)
         # asdict() drops the front end's `kind` (a ClassVar), so add it back
         d["frontend"] = self.frontend.to_dict()
+
+        # Fields added after models were trained are left out while at their defaults, so the
+        # hashes (and names) of every earlier model stay the same
+        if d["train"].get("mix") == "concat":
+            d["train"].pop("mix")
+        for cond in d["train"]["train_conditions"]:
+            if cond.get("level_range") is None:
+                cond.pop("level_range", None)
+            else:
+                cond["level_range"] = list(cond["level_range"])
         return d
 
     @classmethod

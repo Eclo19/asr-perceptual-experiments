@@ -320,6 +320,56 @@ def stage_compare():
     print("  note        on toy data both should be near 0%, so p is expected to be large")
 
 
+def stage_multilevel():
+    """Multi-level training: clean speech at a random level from 45–85 dB SPL, 3 draws per utterance,
+    one draw per utterance per epoch (mix="sample"). Log-mel live, then CARFAC through the caches."""
+    import dataclasses
+    mel = state["mel"]
+    train = dataclasses.replace(mel.cfg.train, train_conditions=(Condition(level_range=(45, 85)),),
+                                n_noisy_variants=3, mix="sample")
+    ml = mel.with_changes(train=train)
+    print(f"  config      {ml.cfg.hash()} | training {[c.name for c in train.train_conditions]}, 3 variants, sample")
+    check(ml.cfg.hash() != mel.cfg.hash(), "multi-level config has the same hash as the clean one")
+    check(ml.clean.speech_db_spl == 65, f"reference level should be 65 dB SPL, got {ml.clean.speech_db_spl}")
+
+    # Sampling: an epoch has as many batches as clean training (one copy per utterance)
+    ds = ml._make_dataset(ml.cfg.data.train_split, train.train_conditions, train=True, n_variants=3)
+    clean_ds = mel._make_dataset(mel.cfg.data.train_split, mel.cfg.train.train_conditions, train=True)
+    n_ml, n_clean = len(ml._make_loader(ds, train=True)), len(mel._make_loader(clean_ds, train=True))
+    print(f"  batches     {n_ml} per epoch (clean training: {n_clean}); dataset holds {len(ds)} items")
+    check(len(ds) == 3 * len(clean_ds) and n_ml == n_clean, "sample mixing should keep the clean epoch length")
+
+    ml.fit()
+    print(f"  name        {ml.name}")
+    print(f"  best val    {ml.history.best_val_wer:.1%} WER at epoch {ml.history.best_epoch}")
+    check("lvl45-85" in ml.name, "model name should carry the level range")
+    check(ml.history.best_val_wer < 0.25, f"multi-level log-mel didn't learn: {ml.history.best_val_wer:.1%}")
+
+    # Inside its training range the multi-level model should work at every level, unlike the
+    # clean-trained one (validation split: the 8 toy test clips are too few to judge generalization)
+    levels = [Condition(speech_db_spl=x) for x in (45, 65, 85)]
+    wer_ml = ml.benchmark(levels, split="validation").set_index("condition")["wer"]
+    wer_clean = state["mel_loaded"].benchmark(levels, split="validation").set_index("condition")["wer"]
+    for c in levels:
+        print(f"  {c.name:14s} multi-level {wer_ml[c.name]:6.1%}   clean-trained {wer_clean[c.name]:6.1%}")
+    check(wer_ml.max() < 0.25, "multi-level model fails inside its training range")
+    check(wer_ml["clean@45dBSPL"] <= wer_clean["clean@45dBSPL"], "multi-level training didn't help at 45 dB SPL")
+
+    # CARFAC: one cache per draw (3) for training, plus validation and test
+    if args.skip_carfac or "carfac" not in state:
+        print("  CARFAC      skipped (needs stage 9)")
+        return
+    cml = state["carfac"].with_changes(train=train)
+    locations = cml.precompute_features()
+    for loc in locations:
+        print(f"  cache       {loc.relative_to(state['root'])}")
+    names = [loc.name for loc in locations]
+    check(sum(n.startswith("clean@45-85dBSPL_v") for n in names) == 3, "expected 3 training caches (v0, v1, v2)")
+    cml.fit()
+    print(f"  CARFAC val  {cml.history.best_val_wer:.1%} WER at epoch {cml.history.best_epoch}")
+    check(cml.history.best_val_wer < 0.25, f"multi-level CARFAC didn't learn: {cml.history.best_val_wer:.1%}")
+
+
 # =============================================================================
 # Run
 # =============================================================================
@@ -335,6 +385,7 @@ runner.run("8. Benchmark conditions", stage_benchmark, needs=("7. Save, load, tr
 runner.run("9. CARFAC: cache, train, evaluate", stage_carfac, needs=("6. Train log-mel",))
 runner.run("10. Compare mel vs CARFAC", stage_compare,
            needs=("7. Save, load, transcribe", "9. CARFAC: cache, train, evaluate"))
+runner.run("11. Multi-level training (log-mel, CARFAC)", stage_multilevel, needs=("7. Save, load, transcribe",))
 
 ok = runner.summary()
 

@@ -204,8 +204,9 @@ class LocalFolderCorpus(SpeechCorpus):
 class FeatureDataset(Dataset):
     """(feats f32[T, F], tokens int64[U], utt_id) for every (condition, variant, utterance).
 
-    Several conditions (Phase 2) are simply concatenated: item i is condition i // n_utts,
-    utterance i % n_utts. Noisy conditions get `n_variants` different noise draws each.
+    Several conditions are simply concatenated: item i is (condition, variant) i // n_utts,
+    utterance i % n_utts. Random conditions (noise and/or level_range) get `n_variants` different
+    draws each. With LengthBucketSampler(groups=...), each epoch uses one copy per utterance instead.
 
     Features come from `cache` when given (one CachedFeatures per (condition, variant), built by
     cache.py; required for CARFAC), otherwise they're computed live by the Featurizer (mel, MFCC).
@@ -221,8 +222,8 @@ class FeatureDataset(Dataset):
         self.bank = bank
         self.cache = cache
 
-        # One entry per (condition, variant): clean conditions need only variant 0
-        self.items = [(c, v) for c in conditions for v in range(max(1, n_variants) if c.noise else 1)]
+        # One entry per (condition, variant): deterministic conditions need only variant 0
+        self.items = [(c, v) for c in conditions for v in range(max(1, n_variants) if c.is_random else 1)]
         if cache is not None and len(cache) != len(self.items):
             raise ValueError(f"Got {len(cache)} caches for {len(self.items)} (condition, variant) pairs")
 
@@ -245,6 +246,10 @@ class FeatureDataset(Dataset):
     def n_frames(self) -> np.ndarray:
         """Frames per item, in dataset order (for LengthBucketSampler)."""
         return np.tile(self._frames, len(self.items))
+
+    def utterance_frames(self) -> np.ndarray:
+        """Frames per utterance, once each (for LengthBucketSampler(groups=len(self.items)))."""
+        return self._frames
 
     def __getitem__(self, i: int):
         # Which (condition, variant) and which utterance this item is
@@ -287,14 +292,28 @@ class LengthBucketSampler:
     The order of batches is shuffled every epoch; call set_epoch() each epoch for a new order.
 
     Use it as DataLoader(dataset, batch_sampler=LengthBucketSampler(...), collate_fn=collate).
+
+    groups > 1 ("sample" mixing): the dataset holds `groups` copies of the same n utterances
+    (item g * n + j is copy g of utterance j) and n_frames lists the n utterances once. Each epoch,
+    every utterance is used once, as one copy chosen at random (seeded by seed and epoch).
     """
 
-    def __init__(self, n_frames: Sequence[int], max_frames: int, shuffle: bool = True, seed: int = 0):
+    def __init__(self, n_frames: Sequence[int], max_frames: int, shuffle: bool = True, seed: int = 0,
+                 groups: int = 1):
         self.n_frames = np.asarray(n_frames)
         self.max_frames = max_frames
         self.shuffle = shuffle
         self.seed = seed
+        self.groups = groups
         self.epoch = 0
+
+    def copies(self) -> np.ndarray:
+        """Which copy each utterance uses this epoch, int[n]: all 0 when groups == 1."""
+        if self.groups == 1:
+            return np.zeros(len(self.n_frames), dtype=np.int64)
+        # Its own generator (not the batching one), so the batches don't depend on the copy choice
+        rng = np.random.default_rng([self.seed, self.epoch, 1])
+        return rng.integers(self.groups, size=len(self.n_frames))
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
@@ -323,6 +342,11 @@ class LengthBucketSampler:
         # Shuffle the order of the batches (not their contents)
         if self.shuffle:
             rng.shuffle(batches)
+
+        # Utterance j → dataset item (copy g of utterance j) = g * n + j
+        if self.groups > 1:
+            offset = self.copies() * len(self.n_frames)
+            batches = [[int(offset[j] + j) for j in batch] for batch in batches]
         return batches
 
     def __iter__(self):

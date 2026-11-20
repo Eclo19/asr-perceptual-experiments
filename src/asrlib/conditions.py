@@ -81,18 +81,22 @@ class Condition:
     the level is set, for every front end. Then noise is scaled to `speech_db_spl - snr_db`,
     so the SNR is relative to the SPEECH. The mixture is never renormalized.
 
-    noise:  None (clean), "white" (generated), or a folder name under noise/ ("pub", "babble", ...)
-    split:  which part of each noise recording to use; training and test noise never overlap
+    noise:        None (clean), "white" (generated), or a folder name under noise/ ("pub", "babble", ...)
+    split:        which part of each noise recording to use; training and test noise never overlap
+    level_range:  (low, high) dB SPL: each utterance's level is drawn uniformly (in dB) from this range,
+                  seeded by (utterance, variant), instead of using speech_db_spl. For multi-level training.
 
         Condition()                                  # clean speech at 65 dB SPL
         Condition("pub", 5)                          # pub noise at 5 dB SNR (test part of the recordings)
         Condition("babble", 0, split="train")        # for multi-condition training
         Condition(speech_db_spl=45)                  # quiet clean speech (level sweep)
+        Condition(level_range=(45, 85))              # clean speech at a random level per utterance
     """
     noise: str | None = None
     snr_db: float | None = None
     speech_db_spl: float = DEFAULT_SPEECH_DB_SPL
     split: Literal["train", "test"] = "test"
+    level_range: tuple[float, float] | None = None
 
     def __post_init__(self):
         # A noise needs an SNR and an SNR needs a noise
@@ -103,16 +107,51 @@ class Condition:
         if self.split not in ("train", "test"):
             raise ValueError(f"split must be 'train' or 'test', not {self.split!r}")
 
+        if self.level_range is not None:
+            # JSON turns tuples into lists: store a tuple of floats, so equal conditions hash equal
+            low, high = (float(x) for x in self.level_range)
+            object.__setattr__(self, "level_range", (low, high))
+            if not low < high:
+                raise ValueError(f"level_range must be (low, high) with low < high, not {self.level_range}")
+            # The range replaces the fixed level: a second, ignored level would only mislead
+            if self.speech_db_spl != DEFAULT_SPEECH_DB_SPL:
+                raise ValueError("Set either speech_db_spl or level_range, not both")
+
+    @property
+    def is_random(self) -> bool:
+        """True when the condition draws something per utterance (a noise segment or a level), so
+        several variants of one utterance differ. Clean speech at a fixed level is deterministic."""
+        return self.noise is not None or self.level_range is not None
+
+    @property
+    def reference_db_spl(self) -> float:
+        """The level this condition is centred on: speech_db_spl, or the middle of level_range (in dB).
+        Validation and transcribe() calibrate to it."""
+        if self.level_range is None:
+            return self.speech_db_spl
+        return (self.level_range[0] + self.level_range[1]) / 2
+
+    def level_db_spl(self, utt_id: str, variant: int = 0) -> float:
+        """The speech level for this utterance and variant: fixed, or drawn from level_range."""
+        if self.level_range is None:
+            return self.speech_db_spl
+        # A generator of its own, so the level draw never changes which noise segment is used
+        key = f"level|{self.level_range[0]:g}|{self.level_range[1]:g}|{utt_id}|{variant}".encode()
+        seed = int.from_bytes(hashlib.sha256(key).digest()[:8], "little")
+        return float(np.random.default_rng(seed).uniform(*self.level_range))
+
     @property
     def name(self) -> str:
-        """'clean', 'pub@5dB', 'clean@45dBSPL', 'babble@0dB@85dBSPL', 'pub@5dB-trainnoise', ...
+        """'clean', 'pub@5dB', 'clean@45dBSPL', 'babble@0dB@85dBSPL', 'pub@5dB-trainnoise', 'clean@45-85dBSPL', ...
 
         Used in feature-cache folder names, so every field that changes the audio appears in it.
         """
         base = "clean" if self.noise is None else f"{self.noise}@{self.snr_db:g}dB"
 
         # The level only appears when it isn't the default, to keep common names short
-        if self.speech_db_spl != DEFAULT_SPEECH_DB_SPL:
+        if self.level_range is not None:
+            base += f"@{self.level_range[0]:g}-{self.level_range[1]:g}dBSPL"
+        elif self.speech_db_spl != DEFAULT_SPEECH_DB_SPL:
             base += f"@{self.speech_db_spl:g}dBSPL"
 
         # Training-part noise must never share a cache folder with test-part noise
@@ -136,10 +175,11 @@ class Condition:
               variant: int = 0) -> torch.Tensor:
         """Degrade one waveform f32[N], the same way every time → f32[N].
 
-        variant > 0 gives a different noise segment for the same utterance (Phase 2's K copies).
+        variant > 0 gives a different noise segment (and level, with level_range) for the same utterance.
         """
-        # 1. Speech at the calibrated level
-        speech = set_level(wave.float(), self.speech_db_spl)
+        # 1. Speech at the calibrated level (fixed, or drawn from level_range)
+        level = self.level_db_spl(utt_id, variant)
+        speech = set_level(wave.float(), level)
 
         # Clean: the level is the whole condition
         if self.noise is None:
@@ -155,7 +195,7 @@ class Condition:
             noise = bank.segment(self.noise, self.split, len(speech), rng)
 
         # 3. Noise level = speech level - SNR, then mix (float32, no clipping, no renormalizing)
-        noise = set_level(noise, self.speech_db_spl - self.snr_db)
+        noise = set_level(noise, level - self.snr_db)
         return speech + noise
 
 
